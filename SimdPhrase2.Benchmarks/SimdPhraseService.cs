@@ -18,7 +18,7 @@ namespace SimdPhrase2.Benchmarks
         public void Index(IEnumerable<(string content, uint docId)> docs)
         {
             // Indexer clears the directory in constructor
-            using (var indexer = new Indexer(_indexPath))
+            using (var indexer = new Indexer(_indexPath, CommonTokensConfig.None))
             {
                 indexer.Index(docs);
             }
@@ -32,11 +32,16 @@ namespace SimdPhrase2.Benchmarks
             }
         }
 
-        public int Search(string query)
+        public int Search(string query, List<int> results = null)
         {
             if (_searcher == null) PrepareSearcher();
-            var results = _searcher.Search(query);
-            return results.Count;
+            var searchResults = _searcher.Search(query);
+            foreach (var result in searchResults)
+            {
+                results?.Add((int)result);
+            }
+
+            return searchResults.Count;
         }
 
         public void Dispose()

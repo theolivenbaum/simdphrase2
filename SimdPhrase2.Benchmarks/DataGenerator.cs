@@ -118,6 +118,7 @@ namespace SimdPhrase2.Benchmarks
         public string GetRandomPhrase(int length = 2)
         {
             var sb = new StringBuilder();
+
             for (int i = 0; i < length; i++)
             {
                  // Phrases in queries are often natural language, so Zipf sampling makes sense

@@ -37,8 +37,11 @@ namespace SimdPhrase2.Benchmarks
         {
             var generator = new DataGenerator(42, 10000, 1.0);
             var docs = generator.GenerateDocuments(N);
+            
+            var tempPath = Path.Combine(Path.GetTempPath(), "SimdPhrase2.Benchmark", "Run");
+            Directory.CreateDirectory(tempPath);
 
-            _luceneService = new LuceneService($"lucene_index_{N}");
+            _luceneService = new LuceneService(Path.Combine(tempPath, $"lucene_index_{N}"));
             _luceneService.Index(docs);
             _luceneService.PrepareSearcher();
 
@@ -49,7 +52,8 @@ namespace SimdPhrase2.Benchmarks
         public void Cleanup()
         {
             _luceneService?.Dispose();
-            if (Directory.Exists($"lucene_index_{N}")) Directory.Delete($"lucene_index_{N}", true);
+            var tempPath = Path.Combine(Path.GetTempPath(), "SimdPhrase2.Benchmark", "Run");
+            if (Directory.Exists(Path.Combine(tempPath, $"lucene_index_{N}"))) Directory.Delete(Path.Combine(tempPath, $"lucene_index_{N}"), true);
         }
 
         [Benchmark]
@@ -88,7 +92,9 @@ namespace SimdPhrase2.Benchmarks
             var generator = new DataGenerator(42, 10000, 1.0);
             var docs = generator.GenerateDocuments(N);
 
-            _simdPhraseService = new SimdPhraseService($"simd_index_{N}");
+            var tempPath = Path.Combine(Path.GetTempPath(), "SimdPhrase2.Benchmark", "Run");
+
+            _simdPhraseService = new SimdPhraseService(Path.Combine(tempPath, $"simd_index_{N}"));
             _simdPhraseService.Index(docs);
             _simdPhraseService.PrepareSearcher();
 
@@ -99,7 +105,9 @@ namespace SimdPhrase2.Benchmarks
         public void Cleanup()
         {
             _simdPhraseService?.Dispose();
-            if (Directory.Exists($"simd_index_{N}")) Directory.Delete($"simd_index_{N}", true);
+            var tempPath = Path.Combine(Path.GetTempPath(), "SimdPhrase2.Benchmark", "Run");
+
+            if (Directory.Exists(Path.Combine(tempPath, $"simd_index_{N}"))) Directory.Delete(Path.Combine(tempPath, $"simd_index_{N}"), true);
         }
 
         [Benchmark]

@@ -139,7 +139,7 @@ namespace SimdPhrase2
                         Console.WriteLine($"Token not found: {token}");
                         return new List<uint>();
                     }
-                    Console.WriteLine($"Token found: {token}, Length: {offset.Length}");
+                    //Console.WriteLine($"Token found: {token}, Length: {offset.Length}");
 
                     int ulongCount = (int)(offset.Length / 8);
                     var buffer = new AlignedBuffer<ulong>(ulongCount);

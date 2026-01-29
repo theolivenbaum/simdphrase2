@@ -56,7 +56,7 @@ namespace SimdPhrase2.Benchmarks
             }
         }
 
-        public int Search(string queryStr)
+        public int Search(string queryStr, List<int> results = null)
         {
             if (_searcher == null) PrepareSearcher();
 
@@ -73,7 +73,7 @@ namespace SimdPhrase2.Benchmarks
             }
 
             var query = parser.Parse(parsedQueryStr);
-            var topDocs = _searcher.Search(query, 1000000); // Request many to ensure full enumeration
+            var topDocs = _searcher.Search(query, 10_000_000); // Request many to ensure full enumeration
 
             // Enumerate results to match SimdPhrase behavior
             int count = 0;
@@ -81,6 +81,7 @@ namespace SimdPhrase2.Benchmarks
             {
                 // Accessing doc id is trivial, but let's simulate "getting" the result
                 var id = scoreDoc.Doc;
+                results?.Add(id);
                 count++;
             }
 

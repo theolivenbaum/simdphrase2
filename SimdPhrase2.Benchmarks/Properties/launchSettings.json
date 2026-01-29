@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "SimdPhrase2.Benchmarks": {
+      "commandName": "Project",
+      "commandLineArgs": "validate"
+    }
+  }
+}
