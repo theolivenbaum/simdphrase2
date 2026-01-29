@@ -343,7 +343,7 @@ namespace SimdPhrase2
             return BinaryPrimitives.ReadInt32LittleEndian(buffer);
         }
 
-        public List<(uint DocId, float Score)> SearchBM25(string query, int k = 10, double k1 = 1.2, double b = 0.75)
+        public List<(uint DocId, float Score)> SearchBM25(string query, int k = 10, float k1 = 1.2, float b = 0.75)
         {
             if (_packedFile == null) return new List<(uint, float)>();
 
@@ -358,7 +358,7 @@ namespace SimdPhrase2
             {
                 if (_tokenStore.TryGet(t, out var offset))
                 {
-                     double idf = Math.Log(1 + (N - offset.DocCount + 0.5) / (offset.DocCount + 0.5));
+                     float idf = MathF.Log(1f + (N - offset.DocCount + 0.5f) / (offset.DocCount + 0.5f));
                      if (idf < 0) idf = 0;
 
                      using var packed = LoadPacked(offset);
@@ -366,10 +366,10 @@ namespace SimdPhrase2
                      foreach(var (docId, tf) in freqs)
                      {
                          int docLen = GetDocLength(docId);
-                         double score = idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (docLen / _avgDocLength)));
+                         float score = idf * (tf * (k1 + 1f)) / (tf + k1 * (1f - b + b * (docLen / _avgDocLength)));
 
                          ref float scoreVal = ref CollectionsMarshal.GetValueRefOrAddDefault(scores, docId, out _);
-                         scoreVal += (float)score;
+                         scoreVal += score;
                      }
                 }
             }
