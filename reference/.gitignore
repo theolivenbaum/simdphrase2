@@ -1,0 +1,15 @@
+/target
+/data*
+/db*
+**.mdb
+**.tsv
+.direnv
+/benchmark
+*.txt
+/msmarco*
+*.jsonl
+roaringish_packed
+**.asm
+**.svg
+**.data
+/temp
