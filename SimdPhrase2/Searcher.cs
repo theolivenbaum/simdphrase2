@@ -23,7 +23,7 @@ namespace SimdPhrase2
         // BM25 / Boolean support
         private FileStream? _docLengthsStream;
         private IndexStats _indexStats;
-        private double _avgDocLength;
+        private float _avgDocLength;
 
         public Searcher(string indexName, bool forceNaive = false)
         {
@@ -46,7 +46,7 @@ namespace SimdPhrase2
             string statsPath = Path.Combine(indexName, "index_stats.json");
             _indexStats = IndexStats.Load(statsPath);
             if (_indexStats.TotalDocs > 0)
-                _avgDocLength = (double)_indexStats.TotalTokens / _indexStats.TotalDocs;
+                _avgDocLength = (float)_indexStats.TotalTokens / _indexStats.TotalDocs;
         }
 
         private List<string> MergeAndMinimizeTokens(List<string> tokens)
@@ -343,7 +343,7 @@ namespace SimdPhrase2
             return BinaryPrimitives.ReadInt32LittleEndian(buffer);
         }
 
-        public List<(uint DocId, float Score)> SearchBM25(string query, int k = 10, float k1 = 1.2, float b = 0.75)
+        public List<(uint DocId, float Score)> SearchBM25(string query, int k = 10, float k1 = 1.2f, float b = 0.75f)
         {
             if (_packedFile == null) return new List<(uint, float)>();
 
