@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using Lucene.Net.Analysis.Util;
 using Lucene.Net.Analysis.Standard;
 using Lucene.Net.Documents;
 using Lucene.Net.Index;
@@ -24,7 +25,7 @@ namespace SimdPhrase2.Benchmarks
         {
             _indexPath = indexPath;
             _directory = FSDirectory.Open(_indexPath);
-            _analyzer = new StandardAnalyzer(LuceneVersion.LUCENE_48);
+            _analyzer = new StandardAnalyzer(LuceneVersion.LUCENE_48, CharArraySet.EMPTY_SET);
         }
 
         public void Index(IEnumerable<(string content, uint docId)> docs)
