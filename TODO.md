@@ -10,6 +10,6 @@
 - [x] Implement `Indexer`
 - [x] Implement `Searcher`
 - [x] Add Tests
+- [x] Implement `CommonTokens` optimization (from Rust codebase)
+- [x] Implement `Gallop` intersection (from Rust codebase)
 - [ ] Verify Performance (optional but recommended)
-- [ ] Implement `CommonTokens` optimization (from Rust codebase)
-- [ ] Implement `Gallop` intersection (from Rust codebase)

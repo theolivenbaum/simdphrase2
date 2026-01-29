@@ -17,13 +17,23 @@ namespace SimdPhrase2
         private int _batchId;
         private DocumentStore _docStore;
 
-        public Indexer(string indexName, int batchSize = 300_000)
+        private CommonTokensConfig _commonTokensConfig;
+        private HashSet<string> _commonTokens;
+        private List<(string content, uint docId)> _firstBatchBuffer;
+        private bool _isFirstBatch;
+
+        public Indexer(string indexName, CommonTokensConfig commonTokensConfig = null, int batchSize = 300_000)
         {
             _indexName = indexName;
             _batchSize = batchSize;
+            _commonTokensConfig = commonTokensConfig ?? CommonTokensConfig.None;
             _currentBatch = new Dictionary<string, RoaringishPacked>();
             _currentBatchCount = 0;
             _batchId = 0;
+
+            _firstBatchBuffer = new List<(string, uint)>();
+            _isFirstBatch = true;
+            _commonTokens = new HashSet<string>();
 
             if (Directory.Exists(_indexName)) Directory.Delete(_indexName, true);
             Directory.CreateDirectory(_indexName);
@@ -44,20 +54,70 @@ namespace SimdPhrase2
         {
             _docStore.AddDocument(docId, content);
 
+            if (_isFirstBatch)
+            {
+                _firstBatchBuffer.Add((content, docId));
+                _currentBatchCount++;
+
+                if (_currentBatchCount >= _batchSize)
+                {
+                    FlushBatch();
+                }
+            }
+            else
+            {
+                IndexDocumentInternal(content, docId);
+                _currentBatchCount++;
+                if (_currentBatchCount >= _batchSize)
+                {
+                    FlushBatch();
+                }
+            }
+        }
+
+        private void IndexDocumentInternal(string content, uint docId)
+        {
             string normalized = Utils.Normalize(content);
+            var tokens = Utils.Tokenize(normalized).ToList();
 
             var docTokens = new Dictionary<string, List<uint>>();
 
-            uint pos = 0;
-            foreach (var token in Utils.Tokenize(normalized))
+            for (int i = 0; i < tokens.Count; i++)
             {
-                if (!docTokens.TryGetValue(token, out var list))
+                string t = tokens[i];
+                if (!docTokens.TryGetValue(t, out var list))
                 {
                     list = new List<uint>();
-                    docTokens[token] = list;
+                    docTokens[t] = list;
                 }
-                list.Add(pos);
-                pos++;
+                list.Add((uint)i);
+
+                if (_commonTokens.Count > 0)
+                {
+                    bool isFirstRare = !_commonTokens.Contains(t);
+                    int maxWindow = 3;
+
+                    string currentMerged = t;
+
+                    for (int j = 1; j < maxWindow && (i + j) < tokens.Count; j++)
+                    {
+                        string nextToken = tokens[i+j];
+                        bool isNextRare = !_commonTokens.Contains(nextToken);
+
+                        if (isFirstRare && isNextRare) break;
+
+                        currentMerged += " " + nextToken;
+
+                        if (!docTokens.TryGetValue(currentMerged, out list))
+                        {
+                            list = new List<uint>();
+                            docTokens[currentMerged] = list;
+                        }
+                        list.Add((uint)i);
+
+                        if (isNextRare) break;
+                    }
+                }
             }
 
             foreach (var kvp in docTokens)
@@ -72,16 +132,63 @@ namespace SimdPhrase2
                 }
                 packed.Push(docId, positions);
             }
+        }
 
-            _currentBatchCount++;
-            if (_currentBatchCount >= _batchSize)
+        private void GenerateCommonTokens()
+        {
+            if (_commonTokensConfig is CommonTokensConfig.ListConfig listConfig)
             {
-                FlushBatch();
+                _commonTokens = listConfig.Tokens;
+            }
+            else if (_commonTokensConfig is CommonTokensConfig.FixedNumConfig fixedNumConfig)
+            {
+                var freq = new Dictionary<string, int>();
+                foreach (var (content, _) in _firstBatchBuffer)
+                {
+                    string normalized = Utils.Normalize(content);
+                    foreach (var token in Utils.Tokenize(normalized))
+                    {
+                        freq[token] = freq.GetValueOrDefault(token, 0) + 1;
+                    }
+                }
+                var top = freq.OrderByDescending(kvp => kvp.Value).Take(fixedNumConfig.Num).Select(kvp => kvp.Key);
+                _commonTokens = new HashSet<string>(top);
+            }
+             else if (_commonTokensConfig is CommonTokensConfig.PercentageConfig percentageConfig)
+            {
+                 var freq = new Dictionary<string, int>();
+                foreach (var (content, _) in _firstBatchBuffer)
+                {
+                    string normalized = Utils.Normalize(content);
+                    foreach (var token in Utils.Tokenize(normalized))
+                    {
+                        freq[token] = freq.GetValueOrDefault(token, 0) + 1;
+                    }
+                }
+                int count = (int)(freq.Count * percentageConfig.Percentage);
+                var top = freq.OrderByDescending(kvp => kvp.Value).Take(count).Select(kvp => kvp.Key);
+                _commonTokens = new HashSet<string>(top);
+            }
+
+            if (_commonTokens.Count > 0)
+            {
+                CommonTokensPersistence.Save(Path.Combine(_indexName, "common_tokens.bin"), _commonTokens);
             }
         }
 
         private void FlushBatch()
         {
+            if (_isFirstBatch)
+            {
+                GenerateCommonTokens();
+                foreach (var (content, docId) in _firstBatchBuffer)
+                {
+                    IndexDocumentInternal(content, docId);
+                }
+                _firstBatchBuffer.Clear();
+                _isFirstBatch = false;
+            }
+
             if (_currentBatch.Count == 0) return;
 
             Console.WriteLine($"Flushing batch {_batchId} with {_currentBatchCount} docs and {_currentBatch.Count} unique tokens.");

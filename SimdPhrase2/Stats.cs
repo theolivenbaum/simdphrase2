@@ -8,10 +8,12 @@ namespace SimdPhrase2
         public long FirstIntersect;
         public long FirstIntersectNaive;
         public long FirstIntersectSimd;
+        public long FirstIntersectGallop;
         public long SecondBinarySearch;
         public long SecondIntersect;
         public long SecondIntersectNaive;
         public long SecondIntersectSimd;
+        public long SecondIntersectGallop;
         public long MergePhasesFirstPass;
         public long MergePhasesSecondPass;
         public long GetDocIds;

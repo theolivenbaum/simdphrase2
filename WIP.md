@@ -13,8 +13,8 @@ Porting the `SimdPhrase` Rust library to C# is complete.
 *   Implemented `Indexer` with batch merging.
 *   Implemented `Searcher` with 2-pass phrase search logic.
 *   Verified with Unit Tests and End-to-End Tests.
+*   Implemented `Gallop` intersection (First and Second pass).
+*   Implemented `CommonTokens` optimization (Indexer merging, Searcher DP).
 
 ## Next Steps
 *   Performance benchmarking and tuning.
-*   Implement `CommonTokens` optimization (if required).
-*   Implement `Gallop` intersection (if required).
