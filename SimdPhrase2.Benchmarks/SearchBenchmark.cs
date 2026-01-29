@@ -14,7 +14,7 @@ namespace SimdPhrase2.Benchmarks
         private List<string> _phraseQueries2;
         private List<string> _phraseQueries3;
 
-        [Params(10_000)]
+        [Params(10_000, 100_000, 1_000_000)]
         public int N; // Number of documents
         // Skipping 1M for now as it might be too slow for CI/sandbox limits,
         // but user asked for it. I'll add 500k instead of 1M to be safer or just 1M.
