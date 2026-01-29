@@ -343,15 +343,15 @@ namespace SimdPhrase2
             return BinaryPrimitives.ReadInt32LittleEndian(buffer);
         }
 
-        public List<(uint DocId, double Score)> SearchBM25(string query, int k = 10, double k1 = 1.2, double b = 0.75)
+        public List<(uint DocId, float Score)> SearchBM25(string query, int k = 10, double k1 = 1.2, double b = 0.75)
         {
-            if (_packedFile == null) return new List<(uint, double)>();
+            if (_packedFile == null) return new List<(uint, float)>();
 
             string normalized = Utils.Normalize(query);
             var tokens = Utils.Tokenize(normalized).ToList();
-            if (tokens.Count == 0) return new List<(uint, double)>();
+            if (tokens.Count == 0) return new List<(uint, float)>();
 
-            var scores = new Dictionary<uint, double>();
+            var scores = new Dictionary<uint, float>();
             long N = _stats != null ? _indexStats.TotalDocs : 0; // Using _indexStats
 
             foreach(var t in tokens)
@@ -368,8 +368,8 @@ namespace SimdPhrase2
                          int docLen = GetDocLength(docId);
                          double score = idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (docLen / _avgDocLength)));
 
-                         if (!scores.ContainsKey(docId)) scores[docId] = 0;
-                         scores[docId] += score;
+                         ref float scoreVal = ref CollectionsMarshal.GetValueRefOrAddDefault(scores, docId, out _);
+                         scoreVal += (float)score;
                      }
                 }
             }

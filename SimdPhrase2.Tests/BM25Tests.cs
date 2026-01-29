@@ -61,6 +61,7 @@ namespace SimdPhrase2.Tests
                 Assert.Equal(1u, results[1].DocId);
                 Assert.Equal(2u, results[2].DocId);
 
+                // Assertions will implicitly use float comparison which is fine here since scores should differ significantly
                 Assert.True(results[0].Score > results[1].Score);
                 Assert.True(results[1].Score > results[2].Score);
             }
