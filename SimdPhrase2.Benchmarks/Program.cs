@@ -1,4 +1,5 @@
 using BenchmarkDotNet.Running;
+using System.Reflection;
 
 namespace SimdPhrase2.Benchmarks
 {
@@ -6,7 +7,7 @@ namespace SimdPhrase2.Benchmarks
     {
         public static void Main(string[] args)
         {
-            var summary = BenchmarkRunner.Run<SearchBenchmark>();
+            BenchmarkSwitcher.FromAssembly(Assembly.GetExecutingAssembly()).Run(args);
         }
     }
 }
