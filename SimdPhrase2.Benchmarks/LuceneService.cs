@@ -7,6 +7,7 @@ using Lucene.Net.Documents;
 using Lucene.Net.Index;
 using Lucene.Net.QueryParsers.Classic;
 using Lucene.Net.Search;
+using Lucene.Net.Search.Similarities;
 using Lucene.Net.Store;
 using Lucene.Net.Util;
 
@@ -20,18 +21,24 @@ namespace SimdPhrase2.Benchmarks
         private IndexWriter _writer;
         private DirectoryReader _reader;
         private IndexSearcher _searcher;
+        private bool _useBm25;
 
-        public LuceneService(string indexPath)
+        public LuceneService(string indexPath, bool useBm25 = false)
         {
             _indexPath = indexPath;
             _directory = FSDirectory.Open(_indexPath);
             _analyzer = new StandardAnalyzer(LuceneVersion.LUCENE_48, CharArraySet.EMPTY_SET);
+            _useBm25 = useBm25;
         }
 
         public void Index(IEnumerable<(string content, uint docId)> docs)
         {
             var config = new IndexWriterConfig(LuceneVersion.LUCENE_48, _analyzer);
             config.OpenMode = OpenMode.CREATE;
+            if (_useBm25)
+            {
+                 config.Similarity = new BM25Similarity();
+            }
             _writer = new IndexWriter(_directory, config);
 
             foreach (var (content, docId) in docs)
@@ -53,6 +60,10 @@ namespace SimdPhrase2.Benchmarks
             {
                 _reader = DirectoryReader.Open(_directory);
                 _searcher = new IndexSearcher(_reader);
+                if (_useBm25)
+                {
+                    _searcher.Similarity = new BM25Similarity();
+                }
             }
         }
 
@@ -86,6 +97,49 @@ namespace SimdPhrase2.Benchmarks
             }
 
             return count; // Should match TotalHits usually
+        }
+
+        public int SearchBM25(string queryStr, int k, List<int> results = null)
+        {
+             if (_searcher == null) PrepareSearcher();
+
+             // Standard parsing (not forcing phrase)
+             var parser = new QueryParser(LuceneVersion.LUCENE_48, "content", _analyzer);
+             var query = parser.Parse(queryStr);
+
+             var topDocs = _searcher.Search(query, k);
+             foreach(var scoreDoc in topDocs.ScoreDocs)
+             {
+                 // We need to retrieve the "id" field which corresponds to our generated docId
+                 var doc = _searcher.Doc(scoreDoc.Doc);
+                 if (int.TryParse(doc.Get("id"), out int realId))
+                 {
+                     results?.Add(realId);
+                 }
+             }
+             return topDocs.ScoreDocs.Length;
+        }
+
+        public int SearchBoolean(string queryStr, List<int> results = null)
+        {
+            if (_searcher == null) PrepareSearcher();
+
+            // Lucene QueryParser handles AND, OR, NOT
+            var parser = new QueryParser(LuceneVersion.LUCENE_48, "content", _analyzer);
+            var query = parser.Parse(queryStr);
+
+            // To mimic SimdPhrase Boolean, we probably want all hits?
+            var topDocs = _searcher.Search(query, 10_000_000);
+
+             foreach(var scoreDoc in topDocs.ScoreDocs)
+             {
+                 var doc = _searcher.Doc(scoreDoc.Doc);
+                 if (int.TryParse(doc.Get("id"), out int realId))
+                 {
+                     results?.Add(realId);
+                 }
+             }
+             return topDocs.ScoreDocs.Length;
         }
 
         public void Dispose()

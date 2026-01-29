@@ -384,6 +384,12 @@ namespace SimdPhrase2
              var parser = new BooleanQueryParser();
              var root = parser.Parse(query);
              if (root == null) return new List<uint>();
+             return SearchBoolean(root);
+        }
+
+        public List<uint> SearchBoolean(QueryNode root)
+        {
+             if (root == null) return new List<uint>();
 
              // Evaluate and sort
              var results = Evaluate(root);
