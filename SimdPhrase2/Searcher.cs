@@ -19,7 +19,7 @@ namespace SimdPhrase2
         private Stats _stats;
         private HashSet<string> _commonTokens;
 
-        public Searcher(string indexName)
+        public Searcher(string indexName, bool forceNaive = false)
         {
             _indexName = indexName;
             _tokenStore = new TokenStore(indexName);
@@ -29,7 +29,7 @@ namespace SimdPhrase2
             {
                 _packedFile = File.OpenRead(packedPath);
             }
-            _intersect = new SimdIntersect();
+            _intersect = forceNaive ? new NaiveIntersect() :  new SimdIntersect();
             _stats = new Stats();
             _commonTokens = CommonTokensPersistence.Load(Path.Combine(indexName, "common_tokens.bin"));
         }

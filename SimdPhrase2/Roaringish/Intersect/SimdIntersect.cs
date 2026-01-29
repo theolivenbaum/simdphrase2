@@ -239,7 +239,7 @@ namespace SimdPhrase2.Roaringish.Intersect
              var m00 = GetMask(Vector512.Equals(a, b));
 
              // b1 = swap pairs
-             var b1 = Avx512F.Shuffle(b.AsInt32(), 0xB1).AsUInt64();
+             var b1 = Avx512F.Shuffle(b.AsInt32(), 0x4E).AsUInt64();
              var m01 = GetMask(Vector512.Equals(a, b1));
 
              // a1 = alignr 4 (2 ulongs)

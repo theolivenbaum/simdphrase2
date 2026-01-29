@@ -33,8 +33,11 @@ namespace SimdPhrase2.Benchmarks
 
             var luceneResults = new List<int>();
             var simdResults = new List<int>();
+            var naiveResults = new List<int>();
+
             using (var lucene = new LuceneService(Path.Combine(tempPath, $"lucene_val_{n}")))
-            using (var simd = new SimdPhraseService(Path.Combine(tempPath, $"simd_val_{n}")))
+            using (var simd = new SimdPhraseService(Path.Combine(tempPath, $"simd_val_{n}"), forceNaive: false))
+            using (var naive = new SimdPhraseService(Path.Combine(tempPath, $"simd_naive_val_{n}"), forceNaive: true))
             {
                 lucene.Index(docs);
                 lucene.PrepareSearcher();
@@ -42,69 +45,85 @@ namespace SimdPhrase2.Benchmarks
                 simd.Index(docs);
                 simd.PrepareSearcher();
 
+                naive.Index(docs);
+                naive.PrepareSearcher();
+
                 int lTotal = 0;
                 int sTotal = 0;
+                int nTotal = 0;
 
                 // Single Term
                 for (int i = 0; i < 10; i++)
                 {
+                    luceneResults.Clear();
+                    simdResults.Clear();
+                    naiveResults.Clear();
                     var q = generator.GetRandomTerm();
-                    lTotal += lucene.Search(q);
-                    sTotal += simd.Search(q);
+                    lTotal += lucene.Search(q, luceneResults);
+                    sTotal += simd.Search(q,simdResults);
+                    nTotal += naive.Search(q, naiveResults);
+                    PrintIfDifferent(idToDoc, luceneResults, simdResults, q);
+                    PrintIfDifferent(idToDoc, luceneResults, naiveResults, q);
                 }
 
                 Console.WriteLine($"Single Term Hits: Lucene={lTotal}, SimdPhrase={sTotal} -> {(lTotal == sTotal ? "MATCH" : "MISMATCH")}");
+                Console.WriteLine($"Single Term Hits: Lucene={lTotal}, Naive SimdPhrase={nTotal} -> {(lTotal == nTotal ? "MATCH" : "MISMATCH")}");
 
                 // Phrase 2
-                lTotal = 0; sTotal = 0;
+                lTotal = 0; sTotal = 0; nTotal = 0;
                 
                 for (int i = 0; i < 10; i++)
                 {
                     luceneResults.Clear();
                     simdResults.Clear();
+                    naiveResults.Clear();
                     var q = generator.GetRandomPhrase(2);
                     lTotal += lucene.Search(q, luceneResults);
-                    sTotal += simd.Search(q,simdResults);
-                    if(luceneResults.Count != simdResults.Count)
-                    {
-                        luceneResults.Sort();
-                        simdResults.Sort();
-                        Console.WriteLine("-------------");
-                        Console.WriteLine("Search Term: " + q);
-                        Console.WriteLine("\nLucene: \n" + string.Join("\n", luceneResults.Except(simdResults).Select(v => $"\t{v} '{idToDoc[v]}'")));
-                        Console.WriteLine("\nSIMD2:  \n" + string.Join("\n", simdResults.Except(luceneResults).Select(v => $"\t{v} '{idToDoc[v]}'")));
-
-                        var missing = luceneResults.Except(simdResults).ToHashSet();
-
-                        using (var simd2 = new SimdPhraseService(Path.Combine(tempPath, $"simd_val_dbg_{n}")))
-                        {
-                            var missingDocs = docs.Where(d => missing.Contains((int)d.docId)).ToList();
-                            simd2.Index(missingDocs);
-                            simd2.PrepareSearcher();
-                            var newResults = new List<int>();
-                            Console.WriteLine($"After reindexing: {simd2.Search(q,newResults)}");
-                        }
-
-                        Console.WriteLine("-------------");
-                    }
+                    sTotal += simd.Search(q, simdResults);
+                    nTotal += naive.Search(q, naiveResults);
+                    PrintIfDifferent(idToDoc, luceneResults, simdResults, q);
+                    PrintIfDifferent(idToDoc, luceneResults, naiveResults, q);
                 }
 
                 Console.WriteLine($"Phrase(2) Hits: Lucene={lTotal}, SimdPhrase={sTotal} -> {(lTotal == sTotal ? "MATCH" : "MISMATCH")}");
+                Console.WriteLine($"Single Term Hits: Lucene={lTotal}, Naive SimdPhrase={nTotal} -> {(lTotal == nTotal ? "MATCH" : "MISMATCH")}");
 
                 // Phrase 3
-                lTotal = 0; sTotal = 0;
+                lTotal = 0; sTotal = 0; nTotal = 0;
+
                 for (int i = 0; i < 10; i++)
                 {
+                    luceneResults.Clear();
+                    simdResults.Clear();
+                    naiveResults.Clear();
                     var q = generator.GetRandomPhrase(3);
-                    lTotal += lucene.Search(q);
-                    sTotal += simd.Search(q);
+                    lTotal += lucene.Search(q, luceneResults);
+                    sTotal += simd.Search(q,simdResults);
+                    nTotal += naive.Search(q, naiveResults);
+                    PrintIfDifferent(idToDoc, luceneResults, simdResults, q);
+                    PrintIfDifferent(idToDoc, luceneResults, naiveResults, q);
                 }
                 Console.WriteLine($"Phrase(3) Hits: Lucene={lTotal}, SimdPhrase={sTotal} -> {(lTotal == sTotal ? "MATCH" : "MISMATCH")}");
+                Console.WriteLine($"Single Term Hits: Lucene={lTotal}, Naive SimdPhrase={nTotal} -> {(lTotal == nTotal ? "MATCH" : "MISMATCH")}");
             }
 
             // Clean up
             if (Directory.Exists(Path.Combine(tempPath,$"lucene_val_{n}"))) Directory.Delete(Path.Combine(tempPath,$"lucene_val_{n}"), true);
             if (Directory.Exists(Path.Combine(tempPath,$"simd_val_{n}"))) Directory.Delete(Path.Combine(tempPath,$"simd_val_{n}"), true);
+        }
+
+        private static void PrintIfDifferent(Dictionary<int, string> idToDoc, List<int> luceneResults, List<int> simdResults, string query)
+        {
+            if (luceneResults.Count != simdResults.Count)
+            {
+                luceneResults.Sort();
+                simdResults.Sort();
+                Console.WriteLine("--------------------------------");
+                Console.WriteLine("Search Term: " + query);
+                Console.WriteLine("\nFound by Lucene, not by SIMD2: \n" + string.Join("\n", luceneResults.Except(simdResults).Select(v => $"\t{v} '{idToDoc[v]}'")));
+                Console.WriteLine("\nFound by SIMD2, not by Lucene:  \n" + string.Join("\n", simdResults.Except(luceneResults).Select(v => $"\t{v} '{idToDoc[v]}'")));
+                Console.WriteLine("--------------------------------\n\n");
+            }
         }
     }
 }
