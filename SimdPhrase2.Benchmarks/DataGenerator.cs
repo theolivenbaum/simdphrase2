@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using System.IO;
 
 namespace SimdPhrase2.Benchmarks
 {
@@ -10,20 +11,6 @@ namespace SimdPhrase2.Benchmarks
         private readonly string[] _vocabulary;
         private readonly double[] _zipfCdf;
         private readonly Random _random;
-
-        private static readonly string[] _commonWords = new[]
-        {
-            "the", "of", "and", "a", "to", "in", "is", "you", "that", "it",
-            "he", "was", "for", "on", "are", "as", "with", "his", "they", "I",
-            "at", "be", "this", "have", "from", "or", "one", "had", "by", "word",
-            "but", "not", "what", "all", "were", "we", "when", "your", "can", "said",
-            "there", "use", "an", "each", "which", "she", "do", "how", "their", "if",
-            "will", "up", "other", "about", "out", "many", "then", "them", "these", "so",
-            "some", "her", "would", "make", "like", "him", "into", "time", "has", "look",
-            "two", "more", "write", "go", "see", "number", "no", "way", "could", "people",
-            "my", "than", "first", "water", "been", "call", "who", "oil", "its", "now",
-            "find", "long", "down", "day", "did", "get", "come", "made", "may", "part"
-        };
 
         public DataGenerator(int seed = 42, int vocabSize = 10000, double zipfSkew = 1.0)
         {
@@ -34,21 +21,40 @@ namespace SimdPhrase2.Benchmarks
 
         private string[] GenerateVocabulary(int size)
         {
-            var vocab = new List<string>(size);
-            vocab.AddRange(_commonWords);
+            // Load real words from file or resource.
+            // For now, assume words.txt is available in the output directory
+            // In a real scenario, this would be an embedded resource.
+            string[] realWords;
+            try
+            {
+                realWords = File.ReadAllLines("words.txt");
+            }
+            catch (Exception)
+            {
+                // Fallback if file not found (e.g. during simple build without file copy)
+                // This prevents crashes but ideally words.txt should be there.
+                realWords = new[] { "the", "of", "and", "a", "to", "in", "is", "you", "that", "it" };
+            }
 
-            // Fill the rest with synthetic terms
+            var vocab = new List<string>(size);
+
+            // Filter out extremely short words or noise if desired, but 10k list is usually decent.
+            foreach (var word in realWords)
+            {
+                if (!string.IsNullOrWhiteSpace(word))
+                {
+                    vocab.Add(word.Trim().ToLowerInvariant());
+                    if (vocab.Count >= size) break;
+                }
+            }
+
+            // If we still don't have enough, fill with synthetic
             int current = 0;
             while (vocab.Count < size)
             {
                 vocab.Add($"term{current++}");
             }
 
-            // Truncate if _commonWords is larger than requested size (unlikely for default)
-            if (vocab.Count > size)
-            {
-                return vocab.Take(size).ToArray();
-            }
             return vocab.ToArray();
         }
 
@@ -116,12 +122,6 @@ namespace SimdPhrase2.Benchmarks
             {
                  // Phrases in queries are often natural language, so Zipf sampling makes sense
                  // to find phrases that actually exist (or likely exist).
-                 // However, testing rare phrases is also important.
-                 // Let's mix: 50% chance Zipf, 50% Uniform.
-                 // Actually, simpler to just use Zipf to maximize hit chance for valid phrases,
-                 // or uniform for random testing.
-                 // Let's stick to Zipf for phrases to ensure we are searching for things
-                 // that look like the document text.
                  int idx = SampleZipfIndex();
                  sb.Append(_vocabulary[idx]);
                  if (i < length - 1) sb.Append(" ");
