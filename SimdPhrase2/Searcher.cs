@@ -17,6 +17,7 @@ namespace SimdPhrase2
         private FileStream _packedFile;
         private IIntersect _intersect;
         private Stats _stats;
+        private HashSet<string> _commonTokens;
 
         public Searcher(string indexName)
         {
@@ -30,6 +31,90 @@ namespace SimdPhrase2
             }
             _intersect = new SimdIntersect();
             _stats = new Stats();
+            _commonTokens = CommonTokensPersistence.Load(Path.Combine(indexName, "common_tokens.bin"));
+        }
+
+        private List<string> MergeAndMinimizeTokens(List<string> tokens)
+        {
+            if (_commonTokens.Count == 0) return tokens;
+
+            int n = tokens.Count;
+            long[] dp = new long[n + 1];
+            string[] choice = new string[n];
+            int[] nextIndex = new int[n];
+
+            for (int i = 0; i <= n; i++) dp[i] = long.MaxValue;
+            dp[n] = 0;
+
+            for (int i = n - 1; i >= 0; i--)
+            {
+                // Try single token
+                string t = tokens[i];
+                if (_tokenStore.TryGet(t, out var offset))
+                {
+                    long cost = (offset.Length / 8);
+                    if (dp[i + 1] != long.MaxValue)
+                    {
+                         cost += dp[i + 1];
+                         if (cost < dp[i])
+                         {
+                             dp[i] = cost;
+                             choice[i] = t;
+                             nextIndex[i] = i + 1;
+                         }
+                    }
+                }
+                else
+                {
+                     // Token not found.
+                     // This means searching will fail anyway.
+                     // We prefer to fail fast with this token.
+                     dp[i] = 0;
+                     choice[i] = t;
+                     nextIndex[i] = i + 1;
+                }
+
+                // Try merging
+                bool isFirstRare = !_commonTokens.Contains(t);
+                string currentMerged = t;
+
+                int maxWindow = 3;
+                for (int j = 1; j < maxWindow && (i + j) < n; j++)
+                {
+                    string nextToken = tokens[i+j];
+                    bool isNextRare = !_commonTokens.Contains(nextToken);
+
+                    if (isFirstRare && isNextRare) break;
+
+                    currentMerged += " " + nextToken;
+
+                    if (_tokenStore.TryGet(currentMerged, out offset))
+                    {
+                        if (dp[i + j + 1] != long.MaxValue)
+                        {
+                            long cost = (offset.Length / 8) + dp[i + j + 1];
+                            if (cost < dp[i])
+                            {
+                                dp[i] = cost;
+                                choice[i] = currentMerged;
+                                nextIndex[i] = i + j + 1;
+                            }
+                        }
+                    }
+
+                    if (isNextRare) break;
+                }
+            }
+
+            var result = new List<string>();
+            int curr = 0;
+            while (curr < n)
+            {
+                if (choice[curr] == null) return tokens; // Should not happen
+                result.Add(choice[curr]);
+                curr = nextIndex[curr];
+            }
+            return result;
         }
 
         public List<uint> Search(string query)
@@ -37,9 +122,11 @@ namespace SimdPhrase2
             if (_packedFile == null) return new List<uint>();
 
             string normalized = Utils.Normalize(query);
-            var tokens = Utils.Tokenize(normalized).ToList();
+            var rawTokens = Utils.Tokenize(normalized).ToList();
 
-            if (tokens.Count == 0) return new List<uint>();
+            if (rawTokens.Count == 0) return new List<uint>();
+
+            var tokens = MergeAndMinimizeTokens(rawTokens);
 
             var packedTokens = new List<(string Token, RoaringishPacked Packed)>();
 
@@ -149,10 +236,31 @@ namespace SimdPhrase2
             int lhsI = 0, rhsI = 0, i = 0, j = 0;
 
             // First Pass
-            _intersect.InnerIntersect(true, lhs.AsSpan(), rhs.AsSpan(), ref lhsI, ref rhsI, packedResult, ref i, msbPackedResult, ref j, addToGroup, lhsLen, msbMask, lsbMask, _stats);
+            int packedLen1 = 0;
+            int msbLen1 = 0;
 
-            int packedLen1 = i;
-            int msbLen1 = j;
+            // Check proportion for Gallop First Pass
+            // Avoid division by zero
+            int minLen = Math.Min(lhs.Length, rhs.Length);
+            int maxLen = Math.Max(lhs.Length, rhs.Length);
+            int proportion = minLen > 0 ? maxLen / minLen : 0;
+
+            if (proportion >= 650)
+            {
+                GallopIntersectFirst.Intersect(true, lhs.AsSpan(), rhs.AsSpan(), packedResult, ref i, addToGroup, lhsLen, lsbMask, _stats);
+                packedLen1 = i;
+
+                // We need to run it again for msb part (first=false logic equivalent for GallopFirst)
+                // Note: GallopIntersectFirst handles first=false logic too
+                GallopIntersectFirst.Intersect(false, lhs.AsSpan(), rhs.AsSpan(), msbPackedResult, ref j, addToGroup, lhsLen, lsbMask, _stats);
+                msbLen1 = j;
+            }
+            else
+            {
+                _intersect.InnerIntersect(true, lhs.AsSpan(), rhs.AsSpan(), ref lhsI, ref rhsI, packedResult, ref i, msbPackedResult, ref j, addToGroup, lhsLen, msbMask, lsbMask, _stats);
+                packedLen1 = i;
+                msbLen1 = j;
+            }
 
             if (msbLen1 == 0)
             {
@@ -167,11 +275,24 @@ namespace SimdPhrase2
             msbResult2.SetLength(size);
             using var dummy = new AlignedBuffer<ulong>(0);
 
-            int lhsI2 = 0, rhsI2 = 0, i2 = 0, j2 = 0;
+            int msbLen2 = 0;
 
-            _intersect.InnerIntersect(false, msbPackedResult.AsSpan(0, msbLen1), rhs.AsSpan(), ref lhsI2, ref rhsI2, msbResult2, ref i2, dummy, ref j2, addToGroup, lhsLen, msbMask, lsbMask, _stats);
+            minLen = Math.Min(msbLen1, rhs.Length);
+            maxLen = Math.Max(msbLen1, rhs.Length);
+            proportion = minLen > 0 ? maxLen / minLen : 0;
 
-            int msbLen2 = i2;
+            if (proportion >= 120)
+            {
+                int i2 = 0;
+                GallopIntersectSecond.Intersect(msbPackedResult.AsSpan(0, msbLen1), rhs.AsSpan(), msbResult2, ref i2, lhsLen, lsbMask, _stats);
+                msbLen2 = i2;
+            }
+            else
+            {
+                int lhsI2 = 0, rhsI2 = 0, i2 = 0, j2 = 0;
+                _intersect.InnerIntersect(false, msbPackedResult.AsSpan(0, msbLen1), rhs.AsSpan(), ref lhsI2, ref rhsI2, msbResult2, ref i2, dummy, ref j2, addToGroup, lhsLen, msbMask, lsbMask, _stats);
+                msbLen2 = i2;
+            }
 
             // Merge
             return RoaringishPacked.MergeResults(packedResult, packedLen1, msbResult2, msbLen2);
