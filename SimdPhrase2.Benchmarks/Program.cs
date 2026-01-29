@@ -28,19 +28,23 @@ namespace SimdPhrase2.Benchmarks
 
             int n = 10000;
             Console.WriteLine($"Validating hit counts for N={n}...");
-            var generator = new DataGenerator(42, 10000, 1.0);
+            var generator = new DataGenerator(42, 10_000, 1.0);
             var docs = generator.GenerateDocuments(n);
             
             var idToDoc = docs.ToDictionary(v => (int)v.docId, v => v.content);
 
             var luceneResults = new List<int>();
-            var simdResults = new List<int>();
-            var naiveResults = new List<int>();
+            var simdResults   = new List<uint>();
+            var naiveResults  = new List<uint>();
+
+            var bm25_luceneResults = new List<(int docID, float score)>();
+            var bm25_simdResults   = new List<(uint docID, float score)>();
+
 
             // Phrase / Term Validation
             using (var lucene = new LuceneService(Path.Combine(tempPath, $"lucene_val_{n}")))
-            using (var simd = new SimdPhraseService(Path.Combine(tempPath, $"simd_val_{n}"), forceNaive: false))
-            using (var naive = new SimdPhraseService(Path.Combine(tempPath, $"simd_naive_val_{n}"), forceNaive: true))
+            using (var simd   = new SimdPhraseService(Path.Combine(tempPath, $"simd_val_{n}"), forceNaive: false))
+            using (var naive  = new SimdPhraseService(Path.Combine(tempPath, $"simd_naive_val_{n}"), forceNaive: true))
             {
                 lucene.Index(docs);
                 lucene.PrepareSearcher();
@@ -70,6 +74,7 @@ namespace SimdPhrase2.Benchmarks
                     PrintIfDifferent(idToDoc, luceneResults, simdResults, q);
                     PrintIfDifferent(idToDoc, luceneResults, naiveResults, q);
                 }
+
                 Console.WriteLine($"Single Term Hits: Lucene={lTotal}, SimdPhrase={sTotal}");
 
                 // Phrase 2
@@ -116,7 +121,7 @@ namespace SimdPhrase2.Benchmarks
              // BM25 Validation (Sanity Check)
              Console.WriteLine("\n--- Validating BM25 (Sanity Check) ---");
              using (var lucene = new LuceneService(Path.Combine(tempPath, $"lucene_bm25_val_{n}"), useBm25: true))
-             using (var simd = new SimdPhraseService(Path.Combine(tempPath, $"simd_bm25_val_{n}"), forceNaive: false))
+             using (var simd   = new SimdPhraseService(Path.Combine(tempPath, $"simd_bm25_val_{n}"), forceNaive: false))
              {
                  lucene.Index(docs);
                  lucene.PrepareSearcher();
@@ -132,14 +137,13 @@ namespace SimdPhrase2.Benchmarks
                      var q = generator.GetRandomTerm();
 
                      // We just check if we get results, exact scoring match is unlikely due to implementation differences
-                     lTotal += lucene.SearchBM25(q, 10, luceneResults);
-                     sTotal += simd.SearchBM25(q, 10, simdResults);
+                     lTotal += lucene.SearchBM25(q, 10, bm25_luceneResults);
+                     sTotal += simd.SearchBM25(q, 10, bm25_simdResults);
 
                      // Just verify overlap exists if hits > 0
-                     if (luceneResults.Count > 0 && simdResults.Count > 0)
+                     if (bm25_luceneResults.Count > 0 && bm25_simdResults.Count > 0)
                      {
-                         var intersection = luceneResults.Intersect(simdResults).Count();
-                         // Console.WriteLine($"Query: {q} | Lucene: {luceneResults.Count}, Simd: {simdResults.Count}, Overlap: {intersection}");
+                        PrintScores(idToDoc, bm25_luceneResults, bm25_simdResults, q);
                      }
                  }
                  Console.WriteLine($"BM25 Queries executed. Total Hits returned (sum of top K): Lucene={lTotal}, SimdPhrase={sTotal}");
@@ -149,10 +153,12 @@ namespace SimdPhrase2.Benchmarks
             try { Directory.Delete(tempPath, true); } catch {}
         }
 
-        private static void PrintIfDifferent(Dictionary<int, string> idToDoc, List<int> luceneResults, List<int> simdResults, string query)
+        private static void PrintIfDifferent(Dictionary<int, string> idToDoc, List<int> luceneResults, List<uint> uint_simdResults, string query)
         {
             // For boolean/phrase, exact match is expected.
             // Sorting is required for SequenceEqual
+            var simdResults = uint_simdResults.Select(u => (int)u).ToList();
+
             luceneResults.Sort();
             simdResults.Sort();
 
@@ -172,6 +178,23 @@ namespace SimdPhrase2.Benchmarks
                     Console.WriteLine("\nFound by SIMD2, not by Lucene:  \n" + string.Join("\n", sExceptL.Take(5).Select(v => $"\t{v} '{idToDoc[v]}'")));
 
                 Console.WriteLine("--------------------------------\n");
+            }
+        }
+
+        private static void PrintScores(Dictionary<int, string> idToDoc, List<(int docID, float score)> luceneResults, List<(uint docID, float score)> uint_simdResults, string query)
+        {
+            // For boolean/phrase, exact match is expected.
+            // Sorting is required for SequenceEqual
+            var simdResults = uint_simdResults.Select(u => (docID:(int)u.docID, u.score)).ToList();
+
+            luceneResults.Sort((a,b) => b.score.CompareTo(a.score));
+            simdResults.Sort((a,b) => b.score.CompareTo(a.score));
+
+            Console.WriteLine("--------------------------------");
+
+            foreach(var (lucene, simd) in luceneResults.Zip(simdResults))
+            {
+                Console.WriteLine($"{lucene.docID,10} {lucene.score,5:n2} {simd.docID,10} {simd.score,5:n2}");
             }
         }
     }

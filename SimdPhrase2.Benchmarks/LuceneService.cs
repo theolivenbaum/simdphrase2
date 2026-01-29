@@ -99,7 +99,19 @@ namespace SimdPhrase2.Benchmarks
             return count; // Should match TotalHits usually
         }
 
-        public int SearchBM25(string queryStr, int k, List<int> results = null)
+        public int SearchBM25(string queryStr, int k)
+        {
+             if (_searcher == null) PrepareSearcher();
+
+             // Standard parsing (not forcing phrase)
+             var parser = new QueryParser(LuceneVersion.LUCENE_48, "content", _analyzer);
+             var query = parser.Parse(queryStr);
+
+             var topDocs = _searcher.Search(query, k);
+             return topDocs.ScoreDocs.Length;
+        }
+
+        public int SearchBM25(string queryStr, int k, List<int> results)
         {
              if (_searcher == null) PrepareSearcher();
 
@@ -115,6 +127,27 @@ namespace SimdPhrase2.Benchmarks
                  if (int.TryParse(doc.Get("id"), out int realId))
                  {
                      results?.Add(realId);
+                 }
+             }
+             return topDocs.ScoreDocs.Length;
+        }
+
+        public int SearchBM25(string queryStr, int k, List<(int docID, float score)> results)
+        {
+             if (_searcher == null) PrepareSearcher();
+
+             // Standard parsing (not forcing phrase)
+             var parser = new QueryParser(LuceneVersion.LUCENE_48, "content", _analyzer);
+             var query = parser.Parse(queryStr);
+
+             var topDocs = _searcher.Search(query, k);
+             foreach(var scoreDoc in topDocs.ScoreDocs)
+             {
+                 // We need to retrieve the "id" field which corresponds to our generated docId
+                 var doc = _searcher.Doc(scoreDoc.Doc);
+                 if (int.TryParse(doc.Get("id"), out int realId))
+                 {
+                     results?.Add((realId, scoreDoc.Score));
                  }
              }
              return topDocs.ScoreDocs.Length;

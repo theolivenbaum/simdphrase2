@@ -343,7 +343,7 @@ namespace SimdPhrase2
             return BinaryPrimitives.ReadInt32LittleEndian(buffer);
         }
 
-        public List<(uint DocId, float Score)> SearchBM25(string query, int k = 10, float k1 = 1.2, float b = 0.75)
+        public List<(uint DocId, float Score)> SearchBM25(string query, int k = 10, float k1 = 1.2f, float b = 0.75f)
         {
             if (_packedFile == null) return new List<(uint, float)>();
 
@@ -353,7 +353,7 @@ namespace SimdPhrase2
 
             var scores = new Dictionary<uint, float>();
             long N = _stats != null ? _indexStats.TotalDocs : 0; // Using _indexStats
-
+            float avgDocLength = (float)_avgDocLength;
             foreach(var t in tokens)
             {
                 if (_tokenStore.TryGet(t, out var offset))
@@ -366,7 +366,7 @@ namespace SimdPhrase2
                      foreach(var (docId, tf) in freqs)
                      {
                          int docLen = GetDocLength(docId);
-                         float score = idf * (tf * (k1 + 1f)) / (tf + k1 * (1f - b + b * (docLen / _avgDocLength)));
+                         float score = idf * (tf * (k1 + 1f)) / (tf + k1 * (1f - b + b * (docLen / avgDocLength)));
 
                          ref float scoreVal = ref CollectionsMarshal.GetValueRefOrAddDefault(scores, docId, out _);
                          scoreVal += score;
