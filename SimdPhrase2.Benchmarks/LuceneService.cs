@@ -73,8 +73,18 @@ namespace SimdPhrase2.Benchmarks
             }
 
             var query = parser.Parse(parsedQueryStr);
-            var docs = _searcher.Search(query, 10000);
-            return docs.TotalHits;
+            var topDocs = _searcher.Search(query, 1000000); // Request many to ensure full enumeration
+
+            // Enumerate results to match SimdPhrase behavior
+            int count = 0;
+            foreach (var scoreDoc in topDocs.ScoreDocs)
+            {
+                // Accessing doc id is trivial, but let's simulate "getting" the result
+                var id = scoreDoc.Doc;
+                count++;
+            }
+
+            return count; // Should match TotalHits usually
         }
 
         public void Dispose()

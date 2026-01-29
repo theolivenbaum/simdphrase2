@@ -53,21 +53,27 @@ namespace SimdPhrase2.Benchmarks
         }
 
         [Benchmark]
-        public void Lucene_Search_SingleTerm()
+        public int Lucene_Search_SingleTerm()
         {
-            foreach (var q in _singleTermQueries) _luceneService.Search(q);
+            int total = 0;
+            foreach (var q in _singleTermQueries) total += _luceneService.Search(q);
+            return total;
         }
 
         [Benchmark]
-        public void Lucene_Search_Phrase_Len2()
+        public int Lucene_Search_Phrase_Len2()
         {
-            foreach (var q in _phraseQueries2) _luceneService.Search(q);
+            int total = 0;
+            foreach (var q in _phraseQueries2) total += _luceneService.Search(q);
+            return total;
         }
 
         [Benchmark]
-        public void Lucene_Search_Phrase_Len3()
+        public int Lucene_Search_Phrase_Len3()
         {
-            foreach (var q in _phraseQueries3) _luceneService.Search(q);
+            int total = 0;
+            foreach (var q in _phraseQueries3) total += _luceneService.Search(q);
+            return total;
         }
     }
 
@@ -97,21 +103,27 @@ namespace SimdPhrase2.Benchmarks
         }
 
         [Benchmark]
-        public void SimdPhrase_Search_SingleTerm()
+        public int SimdPhrase_Search_SingleTerm()
         {
-            foreach (var q in _singleTermQueries) _simdPhraseService.Search(q);
+            int total = 0;
+            foreach (var q in _singleTermQueries) total += _simdPhraseService.Search(q);
+            return total;
         }
 
         [Benchmark]
-        public void SimdPhrase_Search_Phrase_Len2()
+        public int SimdPhrase_Search_Phrase_Len2()
         {
-            foreach (var q in _phraseQueries2) _simdPhraseService.Search(q);
+            int total = 0;
+            foreach (var q in _phraseQueries2) total += _simdPhraseService.Search(q);
+            return total;
         }
 
         [Benchmark]
-        public void SimdPhrase_Search_Phrase_Len3()
+        public int SimdPhrase_Search_Phrase_Len3()
         {
-            foreach (var q in _phraseQueries3) _simdPhraseService.Search(q);
+            int total = 0;
+            foreach (var q in _phraseQueries3) total += _simdPhraseService.Search(q);
+            return total;
         }
     }
 }
