@@ -8,6 +8,7 @@ namespace SimdPhrase2.Db
     {
         public long Begin;
         public long Length;
+        public int DocCount;
     }
 
     public class TokenStore : IDisposable
@@ -37,7 +38,23 @@ namespace SimdPhrase2.Db
                     string token = reader.ReadString();
                     long begin = reader.ReadInt64();
                     long len = reader.ReadInt64();
-                    _map[token] = new FileOffset { Begin = begin, Length = len };
+                    int docCount = 0;
+                    // Backward compatibility check could be here, but we are rewriting.
+                    // Assuming fresh index or rebuilt index.
+                    // For safety, checking stream position? No, binary format doesn't support versioning yet.
+                    // We assume the user will re-index.
+                    try
+                    {
+                        docCount = reader.ReadInt32();
+                    }
+                    catch (EndOfStreamException)
+                    {
+                         // If we are reading an old index, we might hit EOF here if we are strict.
+                         // But for now we just proceed. Old indices will be incompatible.
+                         docCount = 0;
+                    }
+
+                    _map[token] = new FileOffset { Begin = begin, Length = len, DocCount = docCount };
                 }
             }
             catch (EndOfStreamException)
@@ -58,13 +75,14 @@ namespace SimdPhrase2.Db
                 writer.Write(kvp.Key);
                 writer.Write(kvp.Value.Begin);
                 writer.Write(kvp.Value.Length);
+                writer.Write(kvp.Value.DocCount);
             }
             _dirty = false;
         }
 
-        public void Add(string token, long begin, long length)
+        public void Add(string token, long begin, long length, int docCount)
         {
-            _map[token] = new FileOffset { Begin = begin, Length = length };
+            _map[token] = new FileOffset { Begin = begin, Length = length, DocCount = docCount };
             _dirty = true;
         }
 

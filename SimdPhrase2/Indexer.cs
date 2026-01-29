@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Buffers.Binary;
 using SimdPhrase2.Db;
 using SimdPhrase2.Roaringish;
 
@@ -22,6 +23,12 @@ namespace SimdPhrase2
         private List<(string content, uint docId)> _firstBatchBuffer;
         private bool _isFirstBatch;
 
+        // Stats
+        private uint _totalDocs;
+        private ulong _totalTokens;
+        private FileStream _docLengthsStream;
+        private readonly object _lock = new object();
+
         public Indexer(string indexName, CommonTokensConfig commonTokensConfig = null, int batchSize = 300_000)
         {
             _indexName = indexName;
@@ -39,6 +46,9 @@ namespace SimdPhrase2
             Directory.CreateDirectory(_indexName);
 
             _docStore = new DocumentStore(_indexName);
+            _docLengthsStream = new FileStream(Path.Combine(_indexName, "doc_lengths.bin"), FileMode.Create, FileAccess.ReadWrite, FileShare.Read);
+            _totalDocs = 0;
+            _totalTokens = 0;
         }
 
         public void Index(IEnumerable<(string content, uint docId)> docs)
@@ -79,6 +89,24 @@ namespace SimdPhrase2
         {
             string normalized = Utils.Normalize(content);
             var tokens = Utils.Tokenize(normalized).ToList();
+
+            // Update stats
+            int docLen = tokens.Count;
+            lock (_lock)
+            {
+                _totalDocs++; // This assumes we add unique documents.
+                _totalTokens += (ulong)docLen;
+
+                // Write doc length (random access to support out-of-order if needed, though usually sequential)
+                long pos = (long)docId * 4;
+                if (pos != _docLengthsStream.Position)
+                {
+                    _docLengthsStream.Seek(pos, SeekOrigin.Begin);
+                }
+                Span<byte> buffer = stackalloc byte[4];
+                BinaryPrimitives.WriteInt32LittleEndian(buffer, docLen);
+                _docLengthsStream.Write(buffer);
+            }
 
             var docTokens = new Dictionary<string, List<uint>>();
 
@@ -223,6 +251,14 @@ namespace SimdPhrase2
         {
             FlushBatch();
             MergeBatches();
+
+            // Save Stats
+            var stats = new IndexStats
+            {
+                TotalDocs = _totalDocs,
+                TotalTokens = _totalTokens
+            };
+            IndexStats.Save(Path.Combine(_indexName, "index_stats.json"), stats);
         }
 
         private void MergeBatches()
@@ -268,10 +304,18 @@ namespace SimdPhrase2
 
                 long startOffset = packedFile.Position;
                 long totalLength = 0;
+                int docCount = 0;
+                uint lastDocId = uint.MaxValue; // sentinel
 
                 // Process first segment
-                packedFile.Write(reader.CurrentData);
-                totalLength += reader.CurrentData.Length;
+                {
+                    var data = reader.CurrentData;
+                    packedFile.Write(data);
+                    totalLength += data.Length;
+
+                    // Count unique docs
+                    CountDocsInPacked(data, ref lastDocId, ref docCount);
+                }
 
                 reader.Next();
                 if (!reader.Finished)
@@ -281,15 +325,20 @@ namespace SimdPhrase2
                 while (pq.Count > 0 && pq.Peek().CurrentToken == token)
                 {
                     var nextReader = pq.Dequeue();
-                    packedFile.Write(nextReader.CurrentData);
-                    totalLength += nextReader.CurrentData.Length;
+                    var data = nextReader.CurrentData;
+
+                    packedFile.Write(data);
+                    totalLength += data.Length;
+
+                    // Count unique docs
+                    CountDocsInPacked(data, ref lastDocId, ref docCount);
 
                     nextReader.Next();
                     if (!nextReader.Finished)
                         pq.Enqueue(nextReader, (nextReader.CurrentToken, nextReader.BatchIndex));
                 }
 
-                tokenStore.Add(token, startOffset, totalLength);
+                tokenStore.Add(token, startOffset, totalLength, docCount);
             }
 
             foreach (var r in readers) r.Dispose();
@@ -300,10 +349,25 @@ namespace SimdPhrase2
             }
         }
 
+        private void CountDocsInPacked(byte[] data, ref uint lastDocId, ref int docCount)
+        {
+             var span = MemoryMarshal.Cast<byte, ulong>(data);
+             for(int i=0; i<span.Length; i++)
+             {
+                 uint docId = RoaringishPacked.UnpackDocId(span[i]);
+                 if (docId != lastDocId)
+                 {
+                     docCount++;
+                     lastDocId = docId;
+                 }
+             }
+        }
+
         public void Dispose()
         {
             foreach(var p in _currentBatch.Values) p.Dispose();
             _docStore.Dispose();
+            _docLengthsStream?.Dispose();
         }
 
         private class BatchReader : IDisposable

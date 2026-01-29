@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Buffers.Binary;
 using SimdPhrase2.Db;
 using SimdPhrase2.Roaringish;
 using SimdPhrase2.Roaringish.Intersect;
@@ -14,10 +15,15 @@ namespace SimdPhrase2
         private readonly string _indexName;
         private TokenStore _tokenStore;
         private DocumentStore _docStore;
-        private FileStream _packedFile;
+        private FileStream? _packedFile;
         private IIntersect _intersect;
         private Stats _stats;
         private HashSet<string> _commonTokens;
+
+        // BM25 / Boolean support
+        private FileStream? _docLengthsStream;
+        private IndexStats _indexStats;
+        private float _avgDocLength;
 
         public Searcher(string indexName, bool forceNaive = false)
         {
@@ -32,6 +38,15 @@ namespace SimdPhrase2
             _intersect = forceNaive ? new NaiveIntersect() :  new SimdIntersect();
             _stats = new Stats();
             _commonTokens = CommonTokensPersistence.Load(Path.Combine(indexName, "common_tokens.bin"));
+
+            string docLengthsPath = Path.Combine(indexName, "doc_lengths.bin");
+            if (File.Exists(docLengthsPath))
+                _docLengthsStream = File.OpenRead(docLengthsPath);
+
+            string statsPath = Path.Combine(indexName, "index_stats.json");
+            _indexStats = IndexStats.Load(statsPath);
+            if (_indexStats.TotalDocs > 0)
+                _avgDocLength = (float)_indexStats.TotalTokens / _indexStats.TotalDocs;
         }
 
         private List<string> MergeAndMinimizeTokens(List<string> tokens)
@@ -117,6 +132,20 @@ namespace SimdPhrase2
             return result;
         }
 
+        private RoaringishPacked LoadPacked(FileOffset offset)
+        {
+             int ulongCount = (int)(offset.Length / 8);
+             var buffer = new AlignedBuffer<ulong>(ulongCount);
+             buffer.SetLength(ulongCount);
+
+             _packedFile.Seek(offset.Begin, SeekOrigin.Begin);
+
+             Span<byte> byteSpan = MemoryMarshal.Cast<ulong, byte>(buffer.AsSpan());
+             _packedFile.ReadExactly(byteSpan);
+
+             return new RoaringishPacked(buffer, takeOwnership: true);
+        }
+
         public List<uint> Search(string query)
         {
             if (_packedFile == null) return new List<uint>();
@@ -136,21 +165,11 @@ namespace SimdPhrase2
                 {
                     if (!_tokenStore.TryGet(token, out var offset))
                     {
-                        Console.WriteLine($"Token not found: {token}");
+                        // Console.WriteLine($"Token not found: {token}");
                         return new List<uint>();
                     }
-                    //Console.WriteLine($"Token found: {token}, Length: {offset.Length}");
 
-                    int ulongCount = (int)(offset.Length / 8);
-                    var buffer = new AlignedBuffer<ulong>(ulongCount);
-                    buffer.SetLength(ulongCount);
-
-                    _packedFile.Seek(offset.Begin, SeekOrigin.Begin);
-
-                    Span<byte> byteSpan = MemoryMarshal.Cast<ulong, byte>(buffer.AsSpan());
-                    _packedFile.ReadExactly(byteSpan);
-
-                    packedTokens.Add((token, new RoaringishPacked(buffer, takeOwnership: true)));
+                    packedTokens.Add((token, LoadPacked(offset)));
                 }
 
                 if (packedTokens.Count == 1)
@@ -303,8 +322,106 @@ namespace SimdPhrase2
             _tokenStore.Dispose();
             _docStore.Dispose();
             _packedFile?.Dispose();
+            _docLengthsStream?.Dispose();
         }
 
         public string GetDocument(uint docId) => _docStore.GetDocument(docId);
+
+        // --- BM25 Implementation ---
+
+        private int GetDocLength(uint docId)
+        {
+            if (_docLengthsStream == null) return 0;
+            // docLengths is int32 array.
+            long pos = (long)docId * 4;
+            if (pos >= _docLengthsStream.Length) return 0;
+
+            _docLengthsStream.Seek(pos, SeekOrigin.Begin);
+            Span<byte> buffer = stackalloc byte[4];
+            int read = _docLengthsStream.Read(buffer);
+            if (read < 4) return 0;
+            return BinaryPrimitives.ReadInt32LittleEndian(buffer);
+        }
+
+        public List<(uint DocId, float Score)> SearchBM25(string query, int k = 10, float k1 = 1.2f, float b = 0.75f)
+        {
+            if (_packedFile == null) return new List<(uint, float)>();
+
+            string normalized = Utils.Normalize(query);
+            var tokens = Utils.Tokenize(normalized).ToList();
+            if (tokens.Count == 0) return new List<(uint, float)>();
+
+            var scores = new Dictionary<uint, float>();
+            long N = _stats != null ? _indexStats.TotalDocs : 0; // Using _indexStats
+            float avgDocLength = (float)_avgDocLength;
+            foreach(var t in tokens)
+            {
+                if (_tokenStore.TryGet(t, out var offset))
+                {
+                     float idf = MathF.Log(1f + (N - offset.DocCount + 0.5f) / (offset.DocCount + 0.5f));
+                     if (idf < 0) idf = 0;
+
+                     using var packed = LoadPacked(offset);
+                     var freqs = packed.GetDocIdsAndFreqs();
+                     foreach(var (docId, tf) in freqs)
+                     {
+                         int docLen = GetDocLength(docId);
+                         float score = idf * (tf * (k1 + 1f)) / (tf + k1 * (1f - b + b * (docLen / avgDocLength)));
+
+                         ref float scoreVal = ref CollectionsMarshal.GetValueRefOrAddDefault(scores, docId, out _);
+                         scoreVal += score;
+                     }
+                }
+            }
+
+            return scores.OrderByDescending(kvp => kvp.Value).Take(k).Select(kvp => (kvp.Key, kvp.Value)).ToList();
+        }
+
+        // --- Boolean Implementation ---
+
+        public List<uint> SearchBoolean(string query)
+        {
+             var parser = new BooleanQueryParser();
+             var root = parser.Parse(query);
+             if (root == null) return new List<uint>();
+             return SearchBoolean(root);
+        }
+
+        public List<uint> SearchBoolean(QueryNode root)
+        {
+             if (root == null) return new List<uint>();
+
+             // Evaluate and sort
+             var results = Evaluate(root);
+             return results.OrderBy(x => x).ToList();
+        }
+
+        private IEnumerable<uint> Evaluate(QueryNode node)
+        {
+            if (node is TermNode t)
+            {
+                 // Use Search() to handle phrase search if term is multiple words?
+                 // Parser produces single words.
+                 // But if we want to support phrases in future, Search() is good.
+                 // Also, Search() handles normalization/tokenization of the term properly.
+                 return Search(t.Term);
+            }
+            if (node is AndNode a)
+            {
+                return Evaluate(a.Left).Intersect(Evaluate(a.Right));
+            }
+            if (node is OrNode o)
+            {
+                return Evaluate(o.Left).Union(Evaluate(o.Right));
+            }
+            if (node is NotNode n)
+            {
+                 // Calculate AllDocs - Child
+                 // We need to materialize child to HashSet for efficient check
+                 var childDocs = new HashSet<uint>(Evaluate(n.Child));
+                 return Enumerable.Range(0, (int)_indexStats.TotalDocs).Select(i => (uint)i).Where(id => !childDocs.Contains(id));
+            }
+            return Enumerable.Empty<uint>();
+        }
     }
 }

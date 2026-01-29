@@ -129,5 +129,20 @@ namespace SimdPhrase2.Benchmarks
             }
             return sb.ToString();
         }
+
+        public string GetRandomBooleanQuery()
+        {
+            // Simple generation: A AND B, A OR B, A AND (NOT B)
+            int type = _random.Next(3);
+            string t1 = GetRandomTerm();
+            string t2 = GetRandomTerm();
+
+            if (type == 0) return $"{t1} AND {t2}";
+            if (type == 1) return $"{t1} OR {t2}";
+            // Removing parentheses to ensure compatibility/simplicity with standard parsers
+            if (type == 2) return $"{t1} AND NOT {t2}";
+
+            return t1;
+        }
     }
 }

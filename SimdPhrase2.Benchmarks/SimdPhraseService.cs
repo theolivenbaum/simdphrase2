@@ -34,16 +34,56 @@ namespace SimdPhrase2.Benchmarks
             }
         }
 
-        public int Search(string query, List<int> results = null)
+        public int Search(string query, List<uint> results = null)
         {
             if (_searcher == null) PrepareSearcher();
             var searchResults = _searcher.Search(query);
             foreach (var result in searchResults)
             {
-                results?.Add((int)result);
+                results?.Add(result);
             }
 
             return searchResults.Count;
+        }
+
+        public int SearchBM25(string query, int k)
+        {
+            if (_searcher == null) PrepareSearcher();
+            var searchResults = _searcher.SearchBM25(query, k);
+            return searchResults.Count;
+        }
+
+        public int SearchBM25(string query, int k, List<uint> results)
+        {
+            if (_searcher == null) PrepareSearcher();
+            var searchResults = _searcher.SearchBM25(query, k);
+            foreach (var result in searchResults)
+            {
+                results?.Add(result.DocId);
+            }
+            return searchResults.Count;
+        }
+
+        public int SearchBM25(string query, int k, List<(uint docID, float score)> results)
+        {
+            if (_searcher == null) PrepareSearcher();
+            var searchResults = _searcher.SearchBM25(query, k);
+            foreach (var result in searchResults)
+            {
+                results?.Add((result.DocId, result.Score));
+            }
+            return searchResults.Count;
+        }
+
+        public int SearchBoolean(string query, List<uint> results = null)
+        {
+             if (_searcher == null) PrepareSearcher();
+             var searchResults = _searcher.SearchBoolean(query);
+             foreach(var result in searchResults)
+             {
+                 results?.Add(result);
+             }
+             return searchResults.Count;
         }
 
         public void Dispose()

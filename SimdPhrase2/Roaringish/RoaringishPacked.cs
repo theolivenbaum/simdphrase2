@@ -138,6 +138,36 @@ namespace SimdPhrase2.Roaringish
             return list;
         }
 
+        public List<(uint DocId, int Freq)> GetDocIdsAndFreqs()
+        {
+            var list = new List<(uint DocId, int Freq)>();
+            if (_buffer.Length == 0) return list;
+
+            var span = _buffer.AsSpan();
+            uint lastDocId = UnpackDocId(span[0]);
+            int currentFreq = 0;
+
+            for (int i = 0; i < span.Length; i++)
+            {
+                uint docId = UnpackDocId(span[i]);
+                ushort values = UnpackValues(span[i]);
+                int count = System.Numerics.BitOperations.PopCount(values);
+
+                if (docId != lastDocId)
+                {
+                    list.Add((lastDocId, currentFreq));
+                    lastDocId = docId;
+                    currentFreq = count;
+                }
+                else
+                {
+                    currentFreq += count;
+                }
+            }
+            list.Add((lastDocId, currentFreq));
+            return list;
+        }
+
         public static RoaringishPacked MergeResults(AlignedBuffer<ulong> packed, int packedLen, AlignedBuffer<ulong> msbPacked, int msbLen)
         {
              int capacity = packedLen + msbLen;
