@@ -8,11 +8,13 @@ namespace SimdPhrase2.Benchmarks
     public class SimdPhraseService : IDisposable
     {
         private readonly string _indexPath;
+        private readonly bool _forceNaive;
         private Searcher _searcher;
 
-        public SimdPhraseService(string indexPath)
+        public SimdPhraseService(string indexPath, bool forceNaive)
         {
             _indexPath = indexPath;
+            _forceNaive = forceNaive;
         }
 
         public void Index(IEnumerable<(string content, uint docId)> docs)
@@ -28,7 +30,7 @@ namespace SimdPhrase2.Benchmarks
         {
             if (_searcher == null)
             {
-                _searcher = new Searcher(_indexPath);
+                _searcher = new Searcher(_indexPath, _forceNaive);
             }
         }
 

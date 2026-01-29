@@ -94,7 +94,7 @@ namespace SimdPhrase2.Benchmarks
 
             var tempPath = Path.Combine(Path.GetTempPath(), "SimdPhrase2.Benchmark", "Run");
 
-            _simdPhraseService = new SimdPhraseService(Path.Combine(tempPath, $"simd_index_{N}"));
+            _simdPhraseService = new SimdPhraseService(Path.Combine(tempPath, $"simd_index_{N}"), forceNaive : false);
             _simdPhraseService.Index(docs);
             _simdPhraseService.PrepareSearcher();
 
@@ -108,6 +108,60 @@ namespace SimdPhrase2.Benchmarks
             var tempPath = Path.Combine(Path.GetTempPath(), "SimdPhrase2.Benchmark", "Run");
 
             if (Directory.Exists(Path.Combine(tempPath, $"simd_index_{N}"))) Directory.Delete(Path.Combine(tempPath, $"simd_index_{N}"), true);
+        }
+
+        [Benchmark]
+        public int SimdPhrase_Search_SingleTerm()
+        {
+            int total = 0;
+            foreach (var q in _singleTermQueries) total += _simdPhraseService.Search(q);
+            return total;
+        }
+
+        [Benchmark]
+        public int SimdPhrase_Search_Phrase_Len2()
+        {
+            int total = 0;
+            foreach (var q in _phraseQueries2) total += _simdPhraseService.Search(q);
+            return total;
+        }
+
+        [Benchmark]
+        public int SimdPhrase_Search_Phrase_Len3()
+        {
+            int total = 0;
+            foreach (var q in _phraseQueries3) total += _simdPhraseService.Search(q);
+            return total;
+        }
+    }
+
+    [MemoryDiagnoser]
+    public class NaiveSimdPhraseBenchmark : BaseBenchmark
+    {
+        private SimdPhraseService _simdPhraseService;
+
+        [GlobalSetup]
+        public void Setup()
+        {
+            var generator = new DataGenerator(42, 10000, 1.0);
+            var docs = generator.GenerateDocuments(N);
+
+            var tempPath = Path.Combine(Path.GetTempPath(), "SimdPhrase2.Benchmark", "Run");
+
+            _simdPhraseService = new SimdPhraseService(Path.Combine(tempPath, $"simd_naive_index_{N}"), forceNaive : true);
+            _simdPhraseService.Index(docs);
+            _simdPhraseService.PrepareSearcher();
+
+            SetupQueries(generator);
+        }
+
+        [GlobalCleanup]
+        public void Cleanup()
+        {
+            _simdPhraseService?.Dispose();
+            var tempPath = Path.Combine(Path.GetTempPath(), "SimdPhrase2.Benchmark", "Run");
+
+            if (Directory.Exists(Path.Combine(tempPath, $"simd_naive_index_{N}"))) Directory.Delete(Path.Combine(tempPath, $"simd_naive_index_{N}"), true);
         }
 
         [Benchmark]
