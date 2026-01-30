@@ -23,8 +23,8 @@ namespace SimdPhrase2.Tests
 
             for (uint i = 0; i < 20; i++)
             {
-                 lhs.Push(i, new uint[] { 0, 1 }); // doc i, pos 0, 1
-                 rhs.Push(i, new uint[] { 1, 2 }); // doc i, pos 1, 2
+                 lhs.Push(i, 0, 1); // doc i, pos 0, 1
+                 rhs.Push(i, 1, 2); // doc i, pos 1, 2
             }
 
             int lhsLen = 1;
@@ -63,24 +63,24 @@ namespace SimdPhrase2.Tests
             // 0..9 match
             for (uint i = 0; i < 10; i++)
             {
-                 lhs.Push(i, new uint[] { 0 });
-                 rhs.Push(i, new uint[] { 1 });
+                 lhs.Push(i, 0);
+                 rhs.Push(i, 1);
             }
             // 10..19 lhs only
             for (uint i = 10; i < 20; i++)
             {
-                 lhs.Push(i, new uint[] { 0 });
+                 lhs.Push(i, 0);
             }
              // 20..29 rhs only
             for (uint i = 20; i < 30; i++)
             {
-                 rhs.Push(i, new uint[] { 1 });
+                 rhs.Push(i, 1);
             }
             // 30..39 match
             for (uint i = 30; i < 40; i++)
             {
-                 lhs.Push(i, new uint[] { 0 });
-                 rhs.Push(i, new uint[] { 1 });
+                 lhs.Push(i, 0);
+                 rhs.Push(i, 1);
             }
 
              int lhsLen = 1;

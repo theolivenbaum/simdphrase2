@@ -36,14 +36,13 @@ namespace SimdPhrase2.Tests
         {
             using var packed = new RoaringishPacked();
             uint docId = 1;
-            var positions = new uint[] { 0, 1, 16, 32 };
 
             // 0 -> group 0, value 0 (bit 0)
             // 1 -> group 0, value 1 (bit 1)
             // 16 -> group 1, value 0 (bit 0)
             // 32 -> group 2, value 0 (bit 0)
 
-            packed.Push(docId, positions);
+            packed.Push(docId, 0, 1, 16, 32);
 
             Assert.Equal(3, packed.Length);
 

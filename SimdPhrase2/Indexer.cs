@@ -91,7 +91,7 @@ namespace SimdPhrase2
         {
             // Tokenizer returns spans; normalization is handled by the tokenizer
             var tokens = new List<string>();
-            foreach(var t in _tokenizer.Tokenize(content.AsSpan()))
+            foreach (var t in _tokenizer.Tokenize(content.AsSpan()))
             {
                 tokens.Add(t.ToString());
             }
@@ -135,7 +135,7 @@ namespace SimdPhrase2
 
                     for (int j = 1; j < maxWindow && (i + j) < tokens.Count; j++)
                     {
-                        string nextToken = tokens[i+j];
+                        string nextToken = tokens[i + j];
                         bool isNextRare = !_commonTokens.Contains(nextToken);
 
                         if (isFirstRare && isNextRare) break;
@@ -154,11 +154,8 @@ namespace SimdPhrase2
                 }
             }
 
-            foreach (var kvp in docTokens)
+            foreach (var (token, positions) in docTokens)
             {
-                string token = kvp.Key;
-                List<uint> positions = kvp.Value;
-
                 if (!_currentBatch.TryGetValue(token, out var packed))
                 {
                     packed = new RoaringishPacked();
@@ -188,9 +185,9 @@ namespace SimdPhrase2
                 var top = freq.OrderByDescending(kvp => kvp.Value).Take(fixedNumConfig.Num).Select(kvp => kvp.Key);
                 _commonTokens = new HashSet<string>(top);
             }
-             else if (_commonTokensConfig is CommonTokensConfig.PercentageConfig percentageConfig)
+            else if (_commonTokensConfig is CommonTokensConfig.PercentageConfig percentageConfig)
             {
-                 var freq = new Dictionary<string, int>();
+                var freq = new Dictionary<string, int>();
                 foreach (var (content, _) in _firstBatchBuffer)
                 {
                     foreach (var tokenSpan in _tokenizer.Tokenize(content.AsSpan()))
@@ -247,7 +244,7 @@ namespace SimdPhrase2
                 }
             }
 
-            foreach(var p in _currentBatch.Values) p.Dispose();
+            foreach (var p in _currentBatch.Values) p.Dispose();
             _currentBatch.Clear();
             _currentBatchCount = 0;
             _batchId++;
@@ -280,7 +277,8 @@ namespace SimdPhrase2
                 readers.Add(new BatchReader(path, i));
             }
 
-            var pq = new PriorityQueue<BatchReader, (string, int)>(Comparer<(string, int)>.Create((a, b) => {
+            var pq = new PriorityQueue<BatchReader, (string, int)>(Comparer<(string, int)>.Create((a, b) =>
+            {
                 int cmp = string.CompareOrdinal(a.Item1, b.Item1);
                 if (cmp != 0) return cmp;
                 return a.Item2.CompareTo(b.Item2);
@@ -357,21 +355,21 @@ namespace SimdPhrase2
 
         private void CountDocsInPacked(byte[] data, ref uint lastDocId, ref int docCount)
         {
-             var span = MemoryMarshal.Cast<byte, ulong>(data);
-             for(int i=0; i<span.Length; i++)
-             {
-                 uint docId = RoaringishPacked.UnpackDocId(span[i]);
-                 if (docId != lastDocId)
-                 {
-                     docCount++;
-                     lastDocId = docId;
-                 }
-             }
+            var span = MemoryMarshal.Cast<byte, ulong>(data);
+            for (int i = 0; i < span.Length; i++)
+            {
+                uint docId = RoaringishPacked.UnpackDocId(span[i]);
+                if (docId != lastDocId)
+                {
+                    docCount++;
+                    lastDocId = docId;
+                }
+            }
         }
 
         public void Dispose()
         {
-            foreach(var p in _currentBatch.Values) p.Dispose();
+            foreach (var p in _currentBatch.Values) p.Dispose();
             _docStore.Dispose();
             _docLengthsStream?.Dispose();
         }

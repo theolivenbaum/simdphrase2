@@ -20,13 +20,13 @@ namespace SimdPhrase2.Tests
             // LHS: 0, 100, 200, ...
             for (uint i = 0; i < 2000; i += 100)
             {
-                lhs.Push(i, new uint[] { 0, 1 });
+                lhs.Push(i, 0, 1 );
             }
 
             // RHS: 0..2000
             for (uint i = 0; i < 2000; i++)
             {
-                rhs.Push(i, new uint[] { 1, 2 });
+                rhs.Push(i, 1, 2);
             }
 
             ushort lhsLen = 1;
@@ -89,12 +89,12 @@ namespace SimdPhrase2.Tests
             // Construct mock MSB data
             for (uint i = 0; i < 2000; i += 50)
             {
-                lhs.Push(i, new uint[] { 1 });
+                lhs.Push(i, 1);
             }
 
             for (uint i = 0; i < 2000; i++)
             {
-                rhs.Push(i, new uint[] { 2 });
+                rhs.Push(i, 2);
             }
 
             ushort lhsLen = 1;

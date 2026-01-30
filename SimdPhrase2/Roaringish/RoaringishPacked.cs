@@ -30,7 +30,7 @@ namespace SimdPhrase2.Roaringish
             _ownsBuffer = takeOwnership;
         }
 
-        public void Push(uint docId, IEnumerable<uint> positions)
+        public void Push(uint docId, params IEnumerable<uint> positions)
         {
             ulong packedDocId = PackDocId(docId);
 

@@ -19,10 +19,10 @@ namespace SimdPhrase2.Tests
 
             // Doc 1, positions 0, 1
             // 0 -> group 0, val 0. 1 -> group 0, val 1.
-            lhs.Push(1, new uint[] { 0, 1 });
+            lhs.Push(1, 0, 1);
             // Doc 1, positions 1, 2
             // 1 -> group 0, val 1. 2 -> group 0, val 2.
-            rhs.Push(1, new uint[] { 1, 2 });
+            rhs.Push(1, 1, 2);
 
             int lhsLen = 1;
 
@@ -77,8 +77,8 @@ namespace SimdPhrase2.Tests
             using var lhs = new RoaringishPacked();
             using var rhs = new RoaringishPacked();
 
-            lhs.Push(1, new uint[] { 0 }); // bit 0
-            rhs.Push(1, new uint[] { 5 }); // bit 5
+            lhs.Push(1, 0); // bit 0
+            rhs.Push(1, 5); // bit 5
 
             int lhsLen = 1; // shift 1
 
