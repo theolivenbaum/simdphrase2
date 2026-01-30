@@ -29,7 +29,7 @@ namespace SimdPhrase2
         public Searcher(string indexName, bool forceNaive = false, ITextTokenizer tokenizer = null)
         {
             _indexName = indexName;
-            _tokenizer = tokenizer ?? new RegexTokenizer();
+            _tokenizer = tokenizer ?? new BasicTokenizer();
             _tokenStore = new TokenStore(indexName);
             _docStore = new DocumentStore(indexName);
             string packedPath = Path.Combine(indexName, "roaringish_packed.bin");

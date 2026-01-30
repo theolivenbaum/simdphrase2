@@ -34,7 +34,7 @@ namespace SimdPhrase2
         {
             _indexName = indexName;
             _batchSize = batchSize;
-            _tokenizer = tokenizer ?? new RegexTokenizer();
+            _tokenizer = tokenizer ?? new BasicTokenizer();
             _commonTokensConfig = commonTokensConfig ?? CommonTokensConfig.None;
             _currentBatch = new Dictionary<string, RoaringishPacked>();
             _currentBatchCount = 0;
