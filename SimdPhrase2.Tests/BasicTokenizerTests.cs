@@ -8,27 +8,35 @@ namespace SimdPhrase2.Tests
     public class BasicTokenizerTests
     {
         [Fact]
-        public void Tokenize_ShouldNormalizeAndSplit()
+        public void Tokenize_ShouldSplitCorrectly()
         {
             var tokenizer = new BasicTokenizer();
-            // "  Hello, World!  " -> "hello, world!" -> ["hello", ",", "world", "!"]
-            var input = "  Hello, World!  ".AsMemory();
-            var expected = new[] { "hello", ",", "world", "!" };
+            // "  Hello, World!  " -> "Hello", ",", "World", "!"
+            var input = "  Hello, World!  ".AsSpan();
+            var expected = new[] { "Hello", ",", "World", "!" };
 
-            var result = tokenizer.Tokenize(input).Select(m => m.ToString()).ToArray();
+            var result = new List<string>();
+            foreach(var t in tokenizer.Tokenize(input))
+            {
+                result.Add(t.ToString());
+            }
 
-            Assert.Equal(expected, result);
+            Assert.Equal(expected, result.ToArray());
         }
 
         [Fact]
         public void Tokenize_EmptyString_ShouldReturnEmpty()
         {
             var tokenizer = new BasicTokenizer();
-            var input = "".AsMemory();
+            var input = "".AsSpan();
 
-            var result = tokenizer.Tokenize(input);
+            var count = 0;
+            foreach(var t in tokenizer.Tokenize(input))
+            {
+                count++;
+            }
 
-            Assert.Empty(result);
+            Assert.Equal(0, count);
         }
 
         [Fact]
@@ -36,13 +44,18 @@ namespace SimdPhrase2.Tests
         {
             var tokenizer = new BasicTokenizer();
             var inputStr = "The quick brown fox jumps over the lazy dog.";
-            var input = inputStr.AsMemory();
+            var input = inputStr.AsSpan();
 
-            // Expected: "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "."
-            var expected = new[] { "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "." };
-            var result = tokenizer.Tokenize(input).Select(m => m.ToString()).ToArray();
+            // Expected: "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "."
+            var expected = new[] { "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "." };
 
-            Assert.Equal(expected, result);
+            var result = new List<string>();
+            foreach(var t in tokenizer.Tokenize(input))
+            {
+                result.Add(t.ToString());
+            }
+
+            Assert.Equal(expected, result.ToArray());
         }
 
         [Fact]
@@ -50,37 +63,52 @@ namespace SimdPhrase2.Tests
         {
             var tokenizer = new BasicTokenizer();
             var inputStr = "a,b.c...d_e";
-            var input = inputStr.AsMemory();
+            var input = inputStr.AsSpan();
 
             // "a", ",", "b", ".", "c", "...", "d_e"
             // Note: _ is a word char in our logic (and regex \w).
             var expected = new[] { "a", ",", "b", ".", "c", "...", "d_e" };
-            var result = tokenizer.Tokenize(input).Select(m => m.ToString()).ToArray();
 
-            Assert.Equal(expected, result);
+            var result = new List<string>();
+            foreach(var t in tokenizer.Tokenize(input))
+            {
+                result.Add(t.ToString());
+            }
+
+            Assert.Equal(expected, result.ToArray());
         }
 
         [Fact]
-        public void Tokenize_UppercasePreservation()
+        public void TokenUtils_NormalizeToString_ShouldLowerCase()
         {
-            // Checks that we actually lowercase
-            var tokenizer = new BasicTokenizer();
-            var input = "UPPER Case".AsMemory();
-            var expected = new[] { "upper", "case" };
-
-            var result = tokenizer.Tokenize(input).Select(m => m.ToString()).ToArray();
-            Assert.Equal(expected, result);
+            var input = "UPPER Case".AsSpan();
+            // Should be lowercased
+            Assert.Equal("upper case", TokenUtils.NormalizeToString(input));
         }
 
         [Fact]
-        public void Tokenize_Unicode()
+        public void TokenUtils_NormalizeToString_ShouldAvoidAllocIfAlreadyLower()
+        {
+            // Hard to test allocation without memory diagnostics, but we can verify correctness
+            var input = "lower case".AsSpan();
+            Assert.Equal("lower case", TokenUtils.NormalizeToString(input));
+        }
+
+        [Fact]
+        public void Integration_TokenizeAndNormalize()
         {
             var tokenizer = new BasicTokenizer();
-            var input = "Crème brûlée".AsMemory();
-            var expected = new[] { "crème", "brûlée" };
+            var input = "Crème Brûlée!".AsSpan();
+            // "Crème", "Brûlée", "!" -> "crème", "brûlée", "!"
+            var expected = new[] { "crème", "brûlée", "!" };
 
-            var result = tokenizer.Tokenize(input).Select(m => m.ToString()).ToArray();
-            Assert.Equal(expected, result);
+            var result = new List<string>();
+            foreach(var t in tokenizer.Tokenize(input))
+            {
+                result.Add(TokenUtils.NormalizeToString(t));
+            }
+
+            Assert.Equal(expected, result.ToArray());
         }
     }
 }

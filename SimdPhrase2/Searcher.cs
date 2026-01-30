@@ -153,9 +153,9 @@ namespace SimdPhrase2
             if (_packedFile == null) return new List<uint>();
 
             var rawTokens = new List<string>();
-            foreach(var t in _tokenizer.Tokenize(query.AsMemory()))
+            foreach(var t in _tokenizer.Tokenize(query.AsSpan()))
             {
-                rawTokens.Add(t.ToString());
+                rawTokens.Add(TokenUtils.NormalizeToString(t));
             }
 
             if (rawTokens.Count == 0) return new List<uint>();
@@ -353,9 +353,9 @@ namespace SimdPhrase2
             if (_packedFile == null) return new List<(uint, float)>();
 
             var tokens = new List<string>();
-            foreach(var t in _tokenizer.Tokenize(query.AsMemory()))
+            foreach(var t in _tokenizer.Tokenize(query.AsSpan()))
             {
-                tokens.Add(t.ToString());
+                tokens.Add(TokenUtils.NormalizeToString(t));
             }
             if (tokens.Count == 0) return new List<(uint, float)>();
 

@@ -1,78 +1,57 @@
 using System;
-using System.Collections.Generic;
 
 namespace SimdPhrase2
 {
     public class BasicTokenizer : ITextTokenizer
     {
-        public IEnumerable<ReadOnlyMemory<char>> Tokenize(ReadOnlyMemory<char> text)
+        public bool GetNextToken(ReadOnlySpan<char> text, int startPosition, out int tokenStart, out int tokenLength, out int nextPosition)
         {
-            if (text.IsEmpty) yield break;
+            tokenStart = 0;
+            tokenLength = 0;
+            nextPosition = startPosition;
 
-            int start = 0;
             int len = text.Length;
+            int pos = startPosition;
 
-            while (start < len)
+            if (pos >= len) return false;
+
+            // Skip whitespace
+            while (pos < len && char.IsWhiteSpace(text[pos]))
             {
-                int tokenStart = start;
-                int tokenLength = 0;
-
-                // Skip whitespace
-                while (tokenStart < len && char.IsWhiteSpace(text.Span[tokenStart]))
-                {
-                    tokenStart++;
-                }
-
-                if (tokenStart >= len)
-                {
-                    start = len;
-                }
-                else
-                {
-                    char c = text.Span[tokenStart];
-                    if (IsWordChar(c))
-                    {
-                        // Consume word
-                        while (tokenStart + tokenLength < len && IsWordChar(text.Span[tokenStart + tokenLength]))
-                        {
-                            tokenLength++;
-                        }
-                    }
-                    else
-                    {
-                        // Consume non-word, non-whitespace sequence
-                        while (tokenStart + tokenLength < len && !IsWordChar(text.Span[tokenStart + tokenLength]) && !char.IsWhiteSpace(text.Span[tokenStart + tokenLength]))
-                        {
-                            tokenLength++;
-                        }
-                    }
-                }
-
-                if (tokenStart >= len) break;
-
-                // Check casing
-                bool needsLower = false;
-                for(int i=0; i<tokenLength; i++)
-                {
-                    if (char.IsUpper(text.Span[tokenStart+i]))
-                    {
-                        needsLower = true;
-                        break;
-                    }
-                }
-
-                if (needsLower)
-                {
-                     string s = text.Span.Slice(tokenStart, tokenLength).ToString().ToLowerInvariant();
-                     yield return s.AsMemory();
-                }
-                else
-                {
-                     yield return text.Slice(tokenStart, tokenLength);
-                }
-
-                start = tokenStart + tokenLength;
+                pos++;
             }
+
+            if (pos >= len)
+            {
+                nextPosition = pos;
+                return false;
+            }
+
+            int start = pos;
+            int length = 0;
+            char c = text[start];
+
+            if (IsWordChar(c))
+            {
+                // Consume word
+                while (start + length < len && IsWordChar(text[start + length]))
+                {
+                    length++;
+                }
+            }
+            else
+            {
+                // Consume non-word, non-whitespace sequence
+                while (start + length < len && !IsWordChar(text[start + length]) && !char.IsWhiteSpace(text[start + length]))
+                {
+                    length++;
+                }
+            }
+
+            tokenStart = start;
+            tokenLength = length;
+            nextPosition = start + length;
+            return true;
         }
 
         private static bool IsWordChar(char c)
