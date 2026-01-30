@@ -84,5 +84,39 @@ namespace SimdPhrase2.Tests
                 Assert.Equal(new uint[] { 0, 1, 2, 3 }, res5.OrderBy(x => x).ToArray());
             }
         }
+
+        [Fact]
+        public void Searcher_ShouldHandlePrefixQueries_AfterPersistence()
+        {
+            var docs = new List<(string, uint)>
+            {
+                ("persistent apple", 10),
+                ("persistent app", 11),
+                ("persistent application", 12),
+                ("transient banana", 13)
+            };
+
+            // Index and Close
+            using (var indexer = new Indexer(_indexName))
+            {
+                indexer.Index(docs);
+            }
+
+            // Re-open in a new searcher instance to simulate persistence load
+            using (var searcher = new Searcher(_indexName))
+            {
+                // Verify tokens are loaded and prefix matcher is rebuilt
+                // "persistent*" -> "persistent" -> 10, 11, 12
+                // Note: "persistent" is a token in all docs.
+
+                // "app*" -> "apple" (10), "app" (11), "application" (12)
+                var res1 = searcher.SearchBoolean("app*");
+                Assert.Equal(new uint[] { 10, 11, 12 }, res1.OrderBy(x => x).ToArray());
+
+                // "ban*" -> "banana" (13)
+                var res2 = searcher.SearchBoolean("ban*");
+                Assert.Equal(new uint[] { 13 }, res2.ToArray());
+            }
+        }
     }
 }
