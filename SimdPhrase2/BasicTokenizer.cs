@@ -7,8 +7,6 @@ namespace SimdPhrase2
     {
         private bool _resetted = true;
 
-        private bool _lastWasUpper = false;
-
         public void Reset()
         {
             _resetted = true;
@@ -67,7 +65,7 @@ namespace SimdPhrase2
             bool needsLower = false;
             var tokenSpan = text.Slice(start, length);
 
-            foreach (var cs in text.Slice(start, length))
+            foreach (var cs in tokenSpan)
             {
                 if (char.IsUpper(cs))
                 {
@@ -76,44 +74,21 @@ namespace SimdPhrase2
                 }
             }
 
-            bool advanceIndex = true;
-
             if (needsLower)
             {
-                if (_lastWasUpper)
+                char[] pooled = length > 256 ? ArrayPool<char>.Shared.Rent(length) : null;
+                Span<char> buffer = length <= 256 ? stackalloc char[length] : pooled.AsSpan(0, length);
+
+                tokenSpan.ToLower(buffer, System.Globalization.CultureInfo.InvariantCulture);
+                overrideToken = buffer.ToString();
+
+                if (pooled is not null)
                 {
-                    char[] pooled = length > 256 ? ArrayPool<char>.Shared.Rent(length) : null;
-
-                    Span<char> buffer = length <= 256 ? stackalloc char[length] : pooled.AsSpan(0, length);
-
-                    tokenSpan.ToLower(buffer, System.Globalization.CultureInfo.InvariantCulture);
-
-                    overrideToken = buffer.ToString();
-
-                    if (pooled is not null)
-                    {
-                        ArrayPool<char>.Shared.Return(pooled);
-                    }
-
-                    advanceIndex = false;
-                    _lastWasUpper = false;
-                }
-                else
-                {
-                    _lastWasUpper = true;
-                    nextPosition = startPosition;
+                    ArrayPool<char>.Shared.Return(pooled);
                 }
             }
-            else
-            {
-                _lastWasUpper = false;
-            }
 
-            if (!_resetted && advanceIndex)
-            {
-                currentIndex++;
-            }
-
+            if (!_resetted) currentIndex++;
             _resetted = false;
 
             return true;
