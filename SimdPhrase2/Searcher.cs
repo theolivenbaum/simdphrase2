@@ -19,15 +19,17 @@ namespace SimdPhrase2
         private IIntersect _intersect;
         private Stats _stats;
         private HashSet<string> _commonTokens;
+        private ITextTokenizer _tokenizer;
 
         // BM25 / Boolean support
         private FileStream? _docLengthsStream;
         private IndexStats _indexStats;
         private float _avgDocLength;
 
-        public Searcher(string indexName, bool forceNaive = false)
+        public Searcher(string indexName, bool forceNaive = false, ITextTokenizer tokenizer = null)
         {
             _indexName = indexName;
+            _tokenizer = tokenizer ?? new RegexTokenizer();
             _tokenStore = new TokenStore(indexName);
             _docStore = new DocumentStore(indexName);
             string packedPath = Path.Combine(indexName, "roaringish_packed.bin");
@@ -150,8 +152,11 @@ namespace SimdPhrase2
         {
             if (_packedFile == null) return new List<uint>();
 
-            string normalized = Utils.Normalize(query);
-            var rawTokens = Utils.Tokenize(normalized).ToList();
+            var rawTokens = new List<string>();
+            foreach(var t in _tokenizer.Tokenize(query.AsMemory()))
+            {
+                rawTokens.Add(t.ToString());
+            }
 
             if (rawTokens.Count == 0) return new List<uint>();
 
@@ -347,8 +352,11 @@ namespace SimdPhrase2
         {
             if (_packedFile == null) return new List<(uint, float)>();
 
-            string normalized = Utils.Normalize(query);
-            var tokens = Utils.Tokenize(normalized).ToList();
+            var tokens = new List<string>();
+            foreach(var t in _tokenizer.Tokenize(query.AsMemory()))
+            {
+                tokens.Add(t.ToString());
+            }
             if (tokens.Count == 0) return new List<(uint, float)>();
 
             var scores = new Dictionary<uint, float>();

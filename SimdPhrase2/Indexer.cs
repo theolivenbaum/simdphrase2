@@ -22,6 +22,7 @@ namespace SimdPhrase2
         private HashSet<string> _commonTokens;
         private List<(string content, uint docId)> _firstBatchBuffer;
         private bool _isFirstBatch;
+        private ITextTokenizer _tokenizer;
 
         // Stats
         private uint _totalDocs;
@@ -29,10 +30,11 @@ namespace SimdPhrase2
         private FileStream _docLengthsStream;
         private readonly object _lock = new object();
 
-        public Indexer(string indexName, CommonTokensConfig commonTokensConfig = null, int batchSize = 300_000)
+        public Indexer(string indexName, CommonTokensConfig commonTokensConfig = null, int batchSize = 300_000, ITextTokenizer tokenizer = null)
         {
             _indexName = indexName;
             _batchSize = batchSize;
+            _tokenizer = tokenizer ?? new RegexTokenizer();
             _commonTokensConfig = commonTokensConfig ?? CommonTokensConfig.None;
             _currentBatch = new Dictionary<string, RoaringishPacked>();
             _currentBatchCount = 0;
@@ -87,8 +89,12 @@ namespace SimdPhrase2
 
         private void IndexDocumentInternal(string content, uint docId)
         {
-            string normalized = Utils.Normalize(content);
-            var tokens = Utils.Tokenize(normalized).ToList();
+            // Tokenizer handles normalization
+            var tokens = new List<string>();
+            foreach(var t in _tokenizer.Tokenize(content.AsMemory()))
+            {
+                tokens.Add(t.ToString());
+            }
 
             // Update stats
             int docLen = tokens.Count;
@@ -173,9 +179,9 @@ namespace SimdPhrase2
                 var freq = new Dictionary<string, int>();
                 foreach (var (content, _) in _firstBatchBuffer)
                 {
-                    string normalized = Utils.Normalize(content);
-                    foreach (var token in Utils.Tokenize(normalized))
+                    foreach (var tokenMem in _tokenizer.Tokenize(content.AsMemory()))
                     {
+                        string token = tokenMem.ToString();
                         freq[token] = freq.GetValueOrDefault(token, 0) + 1;
                     }
                 }
@@ -187,9 +193,9 @@ namespace SimdPhrase2
                  var freq = new Dictionary<string, int>();
                 foreach (var (content, _) in _firstBatchBuffer)
                 {
-                    string normalized = Utils.Normalize(content);
-                    foreach (var token in Utils.Tokenize(normalized))
+                    foreach (var tokenMem in _tokenizer.Tokenize(content.AsMemory()))
                     {
+                        string token = tokenMem.ToString();
                         freq[token] = freq.GetValueOrDefault(token, 0) + 1;
                     }
                 }
