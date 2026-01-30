@@ -99,13 +99,19 @@ namespace SimdPhrase2.Benchmarks
                 for (int j = 0; j < wordCount; j++)
                 {
                     int idx = SampleZipfIndex();
-                    sb.Append(_vocabulary[idx]);
+                    sb.Append(RandomCase(_vocabulary[idx]));
                     if (j < wordCount - 1)
                         sb.Append(" ");
                 }
                 docs.Add((sb.ToString(), i));
             }
             return docs;
+        }
+
+        private string RandomCase(string input)
+        {
+            if (_random.Next(20) < 2) return input.ToUpper();
+            return input;
         }
 
         public string GetRandomTerm()

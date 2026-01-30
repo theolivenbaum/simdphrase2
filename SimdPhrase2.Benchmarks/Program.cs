@@ -46,6 +46,8 @@ namespace SimdPhrase2.Benchmarks
             using (var simd   = new SimdPhraseService(Path.Combine(tempPath, $"simd_val_{n}"), forceNaive: false))
             using (var naive  = new SimdPhraseService(Path.Combine(tempPath, $"simd_naive_val_{n}"), forceNaive: true))
             {
+                //simd.Index(("AND TO potato", 1));
+                
                 lucene.Index(docs);
                 lucene.PrepareSearcher();
 

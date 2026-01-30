@@ -90,64 +90,70 @@ namespace SimdPhrase2
         private void IndexDocumentInternal(string content, uint docId)
         {
             // Tokenizer returns spans; normalization is handled by the tokenizer
-            var tokens = new List<string>();
-            foreach (var t in _tokenizer.Tokenize(content.AsSpan()))
-            {
-                tokens.Add(t.ToString());
-            }
+            var tokens       = new List<(string token, uint index)>();
 
-            // Update stats
-            int docLen = tokens.Count;
-            lock (_lock)
-            {
-                _totalDocs++; // This assumes we add unique documents.
-                _totalTokens += (ulong)docLen;
+            var enumerator = _tokenizer.Tokenize(content.AsSpan()).GetEnumerator();
+            
+            int tokensCount = 0;
+            uint lastIndex = uint.MaxValue;
 
-                // Write doc length (random access to support out-of-order if needed, though usually sequential)
-                long pos = (long)docId * 4;
-                if (pos != _docLengthsStream.Position)
+            while (enumerator.MoveNext())
+            {
+                tokens.Add((enumerator.Current.ToString(), enumerator.CurrentIndex));
+                if(enumerator.CurrentIndex != lastIndex)
                 {
-                    _docLengthsStream.Seek(pos, SeekOrigin.Begin);
+                    tokensCount++;
                 }
-                Span<byte> buffer = stackalloc byte[4];
-                BinaryPrimitives.WriteInt32LittleEndian(buffer, docLen);
-                _docLengthsStream.Write(buffer);
+                lastIndex = enumerator.CurrentIndex;
             }
+
+            UpdateStats(docId, tokensCount);
 
             var docTokens = new Dictionary<string, List<uint>>();
 
             for (int i = 0; i < tokens.Count; i++)
             {
-                string t = tokens[i];
-                if (!docTokens.TryGetValue(t, out var list))
+                var token = tokens[i];
+
+                ref List<uint> list = ref CollectionsMarshal.GetValueRefOrAddDefault(docTokens, token.token, out var exists);
+                
+                if (!exists)
                 {
                     list = new List<uint>();
-                    docTokens[t] = list;
                 }
-                list.Add((uint)i);
+                
+                list.Add(token.index);
 
                 if (_commonTokens.Count > 0)
                 {
-                    bool isFirstRare = !_commonTokens.Contains(t);
+                    bool isFirstRare = !_commonTokens.Contains(token.token);
                     int maxWindow = 3;
 
-                    string currentMerged = t;
-
+                    string currentMerged = token.token;
                     for (int j = 1; j < maxWindow && (i + j) < tokens.Count; j++)
                     {
-                        string nextToken = tokens[i + j];
-                        bool isNextRare = !_commonTokens.Contains(nextToken);
+                        var nextToken = tokens[i + j];
+
+                        if (nextToken.index == token.index)
+                        {
+                            maxWindow++;
+                            continue;
+                        }
+
+                        bool isNextRare = !_commonTokens.Contains(nextToken.token);
 
                         if (isFirstRare && isNextRare) break;
 
                         currentMerged += " " + nextToken;
 
-                        if (!docTokens.TryGetValue(currentMerged, out list))
+                        list = ref CollectionsMarshal.GetValueRefOrAddDefault(docTokens, currentMerged, out exists);
+
+                        if (!exists)
                         {
                             list = new List<uint>();
-                            docTokens[currentMerged] = list;
                         }
-                        list.Add((uint)i);
+
+                        list.Add(token.index);
 
                         if (isNextRare) break;
                     }
@@ -162,6 +168,26 @@ namespace SimdPhrase2
                     _currentBatch[token] = packed;
                 }
                 packed.Push(docId, positions);
+            }
+        }
+
+        private void UpdateStats(uint docId, int docLen)
+        {
+            // Update stats
+            lock (_lock)
+            {
+                _totalDocs++; // This assumes we add unique documents.
+                _totalTokens += (ulong)docLen;
+
+                // Write doc length (random access to support out-of-order if needed, though usually sequential)
+                long pos = (long)docId * 4;
+                if (pos != _docLengthsStream.Position)
+                {
+                    _docLengthsStream.Seek(pos, SeekOrigin.Begin);
+                }
+                Span<byte> buffer = stackalloc byte[4];
+                BinaryPrimitives.WriteInt32LittleEndian(buffer, docLen);
+                _docLengthsStream.Write(buffer);
             }
         }
 

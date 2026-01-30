@@ -17,7 +17,7 @@ namespace SimdPhrase2.Benchmarks
             _forceNaive = forceNaive;
         }
 
-        public void Index(IEnumerable<(string content, uint docId)> docs)
+        public void Index(params IEnumerable<(string content, uint docId)> docs)
         {
             // Indexer clears the directory in constructor
             using (var indexer = new Indexer(_indexPath, CommonTokensConfig.None))

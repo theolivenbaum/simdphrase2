@@ -41,7 +41,7 @@ namespace SimdPhrase2.Db
             }
         }
 
-        public string? GetDocument(uint docId)
+        public string GetDocument(uint docId)
         {
             lock (_lock)
             {

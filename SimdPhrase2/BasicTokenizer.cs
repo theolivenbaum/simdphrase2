@@ -5,7 +5,16 @@ namespace SimdPhrase2
 {
     public class BasicTokenizer : ITextTokenizer
     {
-        public bool GetNextToken(ReadOnlySpan<char> text, int startPosition, out int tokenStart, out int tokenLength, out int nextPosition, out string? overrideToken)
+        private bool _resetted = true;
+
+        private bool _lastWasUpper = false;
+
+        public void Reset()
+        {
+            _resetted = true;
+        }
+
+        public bool GetNextToken(ReadOnlySpan<char> text, ref uint currentIndex, int startPosition, out int tokenStart, out int tokenLength, out int nextPosition, out string overrideToken)
         {
             tokenStart = 0;
             tokenLength = 0;
@@ -67,21 +76,45 @@ namespace SimdPhrase2
                 }
             }
 
+            bool advanceIndex = true;
+
             if (needsLower)
             {
-                char[]? pooled = length > 256 ? ArrayPool<char>.Shared.Rent(length) : null;
-
-                Span<char> buffer = length <= 256 ? stackalloc char[length] : pooled.AsSpan(0, length);
-
-                tokenSpan.ToLower(buffer, System.Globalization.CultureInfo.InvariantCulture);
-
-                overrideToken = buffer.ToString();
-
-                if (pooled is not null)
+                if (_lastWasUpper)
                 {
-                    ArrayPool<char>.Shared.Return(pooled);
+                    char[] pooled = length > 256 ? ArrayPool<char>.Shared.Rent(length) : null;
+
+                    Span<char> buffer = length <= 256 ? stackalloc char[length] : pooled.AsSpan(0, length);
+
+                    tokenSpan.ToLower(buffer, System.Globalization.CultureInfo.InvariantCulture);
+
+                    overrideToken = buffer.ToString();
+
+                    if (pooled is not null)
+                    {
+                        ArrayPool<char>.Shared.Return(pooled);
+                    }
+
+                    advanceIndex = false;
+                    _lastWasUpper = false;
+                }
+                else
+                {
+                    _lastWasUpper = true;
+                    nextPosition = startPosition;
                 }
             }
+            else
+            {
+                _lastWasUpper = false;
+            }
+
+            if (!_resetted && advanceIndex)
+            {
+                currentIndex++;
+            }
+
+            _resetted = false;
 
             return true;
         }
