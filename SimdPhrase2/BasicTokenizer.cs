@@ -57,9 +57,10 @@ namespace SimdPhrase2
             // Check casing and normalize if needed
             bool needsLower = false;
             var tokenSpan = text.Slice(start, length);
-            for (int i = 0; i < length; i++)
+
+            foreach (var cs in text.Slice(start, length))
             {
-                if (char.IsUpper(tokenSpan[i]))
+                if (char.IsUpper(cs))
                 {
                     needsLower = true;
                     break;
@@ -68,24 +69,17 @@ namespace SimdPhrase2
 
             if (needsLower)
             {
-                char[]? pooled = null;
-                if (length > 256)
-                {
-                    pooled = ArrayPool<char>.Shared.Rent(length);
-                }
+                char[]? pooled = length > 256 ? ArrayPool<char>.Shared.Rent(length) : null;
 
-                try
+                Span<char> buffer = length <= 256 ? stackalloc char[length] : pooled.AsSpan(0, length);
+
+                tokenSpan.ToLower(buffer, System.Globalization.CultureInfo.InvariantCulture);
+
+                overrideToken = buffer.ToString();
+
+                if (pooled is not null)
                 {
-                    Span<char> buffer = length <= 256 ? stackalloc char[length] : pooled.AsSpan(0, length);
-                    tokenSpan.ToLower(buffer, System.Globalization.CultureInfo.InvariantCulture);
-                    overrideToken = buffer.ToString();
-                }
-                finally
-                {
-                    if (pooled != null)
-                    {
-                        ArrayPool<char>.Shared.Return(pooled);
-                    }
+                    ArrayPool<char>.Shared.Return(pooled);
                 }
             }
 
