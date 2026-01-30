@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Buffers.Binary;
+using SimdPhrase2.Analysis;
 using SimdPhrase2.Db;
 using SimdPhrase2.Roaringish;
 using SimdPhrase2.Roaringish.Intersect;
@@ -14,6 +15,7 @@ namespace SimdPhrase2
     {
         private readonly string _indexName;
         private TokenStore _tokenStore;
+        private IPrefixMatcher _prefixMatcher;
         private DocumentStore _docStore;
         private FileStream? _packedFile;
         private IIntersect _intersect;
@@ -31,6 +33,7 @@ namespace SimdPhrase2
             _indexName = indexName;
             _tokenizer = tokenizer ?? new BasicTokenizer();
             _tokenStore = new TokenStore(indexName);
+            _prefixMatcher = new FstPrefixMatcher(_tokenStore.GetAllTokens());
             _docStore = new DocumentStore(indexName);
             string packedPath = Path.Combine(indexName, "roaringish_packed.bin");
             if (File.Exists(packedPath))
@@ -408,6 +411,32 @@ namespace SimdPhrase2
         {
             if (node is TermNode t)
             {
+                 if (t.Term.EndsWith("*"))
+                 {
+                     string rawPrefix = t.Term.Substring(0, t.Term.Length - 1);
+                     var tokens = new List<string>();
+                     foreach(var tok in _tokenizer.Tokenize(rawPrefix.AsSpan())) tokens.Add(tok.ToString());
+
+                     if (tokens.Count == 1)
+                     {
+                         string prefix = tokens[0];
+                         var candidates = _prefixMatcher.Match(prefix);
+                         var result = new HashSet<uint>();
+                         foreach(var candidate in candidates)
+                         {
+                             if (_tokenStore.TryGet(candidate, out var offset))
+                             {
+                                 using var packed = LoadPacked(offset);
+                                 foreach (var docId in packed.GetDocIds())
+                                 {
+                                     result.Add(docId);
+                                 }
+                             }
+                         }
+                         return result;
+                     }
+                 }
+
                  // Use Search() to handle phrase search if term is multiple words?
                  // Parser produces single words.
                  // But if we want to support phrases in future, Search() is good.
