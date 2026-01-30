@@ -68,23 +68,23 @@ namespace SimdPhrase2
 
             if (needsLower)
             {
-                if (length <= 256)
+                char[]? pooled = null;
+                if (length > 256)
                 {
-                    Span<char> buffer = stackalloc char[length];
+                    pooled = ArrayPool<char>.Shared.Rent(length);
+                }
+
+                try
+                {
+                    Span<char> buffer = length <= 256 ? stackalloc char[length] : pooled.AsSpan(0, length);
                     tokenSpan.ToLower(buffer, System.Globalization.CultureInfo.InvariantCulture);
                     overrideToken = buffer.ToString();
                 }
-                else
+                finally
                 {
-                    char[] buffer = ArrayPool<char>.Shared.Rent(length);
-                    try
+                    if (pooled != null)
                     {
-                        tokenSpan.ToLower(buffer.AsSpan(0, length), System.Globalization.CultureInfo.InvariantCulture);
-                        overrideToken = new string(buffer, 0, length);
-                    }
-                    finally
-                    {
-                        ArrayPool<char>.Shared.Return(buffer);
+                        ArrayPool<char>.Shared.Return(pooled);
                     }
                 }
             }

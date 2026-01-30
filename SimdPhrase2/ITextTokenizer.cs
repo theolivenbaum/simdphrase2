@@ -8,13 +8,17 @@ namespace SimdPhrase2
     /// </summary>
     public interface ITextTokenizer
     {
-        // Low-level method to advance to the next token.
-        // Returns true if a token was found, false if end of text.
-        // startPosition: index in text to start searching.
-        // tokenStart: output index of start of found token in the original text (if overrideToken is null).
-        // tokenLength: output length of found token.
-        // nextPosition: output index to start next search from.
-        // overrideToken: output string containing the token if it differs from the original text (e.g. due to normalization).
+        /// <summary>
+        /// Low-level method to advance to the next token.
+        /// Returns true if a token was found, false if end of text.
+        /// </summary>
+        /// <param name="text">The source text to tokenize.</param>
+        /// <param name="startPosition">Index in text to start searching.</param>
+        /// <param name="tokenStart">Output index of start of found token in the original text (if overrideToken is null).</param>
+        /// <param name="tokenLength">Output length of found token.</param>
+        /// <param name="nextPosition">Output index to start next search from.</param>
+        /// <param name="overrideToken">Output string containing the token if it differs from the original text (e.g. due to normalization).</param>
+        /// <returns>True if a token was found, otherwise false.</returns>
         bool GetNextToken(ReadOnlySpan<char> text, int startPosition, out int tokenStart, out int tokenLength, out int nextPosition, out string? overrideToken);
     }
 
