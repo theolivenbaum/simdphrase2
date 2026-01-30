@@ -12,8 +12,9 @@ namespace SimdPhrase2.Tests
         {
             var tokenizer = new BasicTokenizer();
             // "  Hello, World!  " -> "Hello", ",", "World", "!"
+            // Normalization is now enabled by default in BasicTokenizer, so we expect lowercase.
             var input = "  Hello, World!  ".AsSpan();
-            var expected = new[] { "Hello", ",", "World", "!" };
+            var expected = new[] { "hello", ",", "world", "!" };
 
             var result = new List<string>();
             foreach(var t in tokenizer.Tokenize(input))
@@ -46,8 +47,8 @@ namespace SimdPhrase2.Tests
             var inputStr = "The quick brown fox jumps over the lazy dog.";
             var input = inputStr.AsSpan();
 
-            // Expected: "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "."
-            var expected = new[] { "The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "." };
+            // Expected: "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "."
+            var expected = new[] { "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "." };
 
             var result = new List<string>();
             foreach(var t in tokenizer.Tokenize(input))
@@ -79,33 +80,34 @@ namespace SimdPhrase2.Tests
         }
 
         [Fact]
-        public void TokenUtils_NormalizeToString_ShouldLowerCase()
+        public void Tokenize_ShouldLowerCase()
         {
+            var tokenizer = new BasicTokenizer();
             var input = "UPPER Case".AsSpan();
             // Should be lowercased
-            Assert.Equal("upper case", TokenUtils.NormalizeToString(input));
+            var expected = new[] { "upper", "case" };
+
+            var result = new List<string>();
+            foreach(var t in tokenizer.Tokenize(input))
+            {
+                result.Add(t.ToString());
+            }
+
+            Assert.Equal(expected, result.ToArray());
         }
 
         [Fact]
-        public void TokenUtils_NormalizeToString_ShouldAvoidAllocIfAlreadyLower()
-        {
-            // Hard to test allocation without memory diagnostics, but we can verify correctness
-            var input = "lower case".AsSpan();
-            Assert.Equal("lower case", TokenUtils.NormalizeToString(input));
-        }
-
-        [Fact]
-        public void Integration_TokenizeAndNormalize()
+        public void Tokenize_Unicode_ShouldLowerCase()
         {
             var tokenizer = new BasicTokenizer();
             var input = "Crème Brûlée!".AsSpan();
-            // "Crème", "Brûlée", "!" -> "crème", "brûlée", "!"
+            // "crème", "brûlée", "!"
             var expected = new[] { "crème", "brûlée", "!" };
 
             var result = new List<string>();
             foreach(var t in tokenizer.Tokenize(input))
             {
-                result.Add(TokenUtils.NormalizeToString(t));
+                result.Add(t.ToString());
             }
 
             Assert.Equal(expected, result.ToArray());

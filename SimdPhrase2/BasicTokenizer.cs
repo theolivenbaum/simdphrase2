@@ -1,14 +1,16 @@
 using System;
+using System.Buffers;
 
 namespace SimdPhrase2
 {
     public class BasicTokenizer : ITextTokenizer
     {
-        public bool GetNextToken(ReadOnlySpan<char> text, int startPosition, out int tokenStart, out int tokenLength, out int nextPosition)
+        public bool GetNextToken(ReadOnlySpan<char> text, int startPosition, out int tokenStart, out int tokenLength, out int nextPosition, out string? overrideToken)
         {
             tokenStart = 0;
             tokenLength = 0;
             nextPosition = startPosition;
+            overrideToken = null;
 
             int len = text.Length;
             int pos = startPosition;
@@ -51,6 +53,42 @@ namespace SimdPhrase2
             tokenStart = start;
             tokenLength = length;
             nextPosition = start + length;
+
+            // Check casing and normalize if needed
+            bool needsLower = false;
+            var tokenSpan = text.Slice(start, length);
+            for (int i = 0; i < length; i++)
+            {
+                if (char.IsUpper(tokenSpan[i]))
+                {
+                    needsLower = true;
+                    break;
+                }
+            }
+
+            if (needsLower)
+            {
+                if (length <= 256)
+                {
+                    Span<char> buffer = stackalloc char[length];
+                    tokenSpan.ToLower(buffer, System.Globalization.CultureInfo.InvariantCulture);
+                    overrideToken = buffer.ToString();
+                }
+                else
+                {
+                    char[] buffer = ArrayPool<char>.Shared.Rent(length);
+                    try
+                    {
+                        tokenSpan.ToLower(buffer.AsSpan(0, length), System.Globalization.CultureInfo.InvariantCulture);
+                        overrideToken = new string(buffer, 0, length);
+                    }
+                    finally
+                    {
+                        ArrayPool<char>.Shared.Return(buffer);
+                    }
+                }
+            }
+
             return true;
         }
 

@@ -155,7 +155,7 @@ namespace SimdPhrase2
             var rawTokens = new List<string>();
             foreach(var t in _tokenizer.Tokenize(query.AsSpan()))
             {
-                rawTokens.Add(TokenUtils.NormalizeToString(t));
+                rawTokens.Add(t.ToString());
             }
 
             if (rawTokens.Count == 0) return new List<uint>();
@@ -355,7 +355,7 @@ namespace SimdPhrase2
             var tokens = new List<string>();
             foreach(var t in _tokenizer.Tokenize(query.AsSpan()))
             {
-                tokens.Add(TokenUtils.NormalizeToString(t));
+                tokens.Add(t.ToString());
             }
             if (tokens.Count == 0) return new List<(uint, float)>();
 

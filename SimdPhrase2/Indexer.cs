@@ -89,11 +89,11 @@ namespace SimdPhrase2
 
         private void IndexDocumentInternal(string content, uint docId)
         {
-            // Tokenizer returns spans; we handle normalization (lowercasing) here efficiently
+            // Tokenizer returns spans; normalization is handled by the tokenizer
             var tokens = new List<string>();
             foreach(var t in _tokenizer.Tokenize(content.AsSpan()))
             {
-                tokens.Add(TokenUtils.NormalizeToString(t));
+                tokens.Add(t.ToString());
             }
 
             // Update stats
@@ -181,7 +181,7 @@ namespace SimdPhrase2
                 {
                     foreach (var tokenSpan in _tokenizer.Tokenize(content.AsSpan()))
                     {
-                        string token = TokenUtils.NormalizeToString(tokenSpan);
+                        string token = tokenSpan.ToString();
                         freq[token] = freq.GetValueOrDefault(token, 0) + 1;
                     }
                 }
@@ -195,7 +195,7 @@ namespace SimdPhrase2
                 {
                     foreach (var tokenSpan in _tokenizer.Tokenize(content.AsSpan()))
                     {
-                        string token = TokenUtils.NormalizeToString(tokenSpan);
+                        string token = tokenSpan.ToString();
                         freq[token] = freq.GetValueOrDefault(token, 0) + 1;
                     }
                 }
