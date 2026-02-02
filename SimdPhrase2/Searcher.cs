@@ -7,6 +7,7 @@ using System.Buffers.Binary;
 using SimdPhrase2.Db;
 using SimdPhrase2.Roaringish;
 using SimdPhrase2.Roaringish.Intersect;
+using SimdPhrase2.QueryModel;
 
 namespace SimdPhrase2
 {
@@ -22,9 +23,12 @@ namespace SimdPhrase2
         private ITextTokenizer _tokenizer;
 
         // BM25 / Boolean support
-        private FileStream? _docLengthsStream;
-        private IndexStats _indexStats;
-        private float _avgDocLength;
+        internal FileStream? _docLengthsStream;
+        internal IndexStats _indexStats;
+        internal float _avgDocLength;
+
+        public long TotalDocs => _indexStats.TotalDocs;
+        public float AvgDocLength => _avgDocLength;
 
         public Searcher(string indexName, bool forceNaive = false, ITextTokenizer tokenizer = null)
         {
@@ -163,7 +167,7 @@ namespace SimdPhrase2
             if (_packedFile == null) return new List<uint>();
 
             var rawTokens = new List<string>();
-            foreach(var t in _tokenizer.Tokenize(query.AsSpan()))
+            foreach (var t in _tokenizer.Tokenize(query.AsSpan()))
             {
                 rawTokens.Add(t.ToString());
             }
@@ -172,84 +176,67 @@ namespace SimdPhrase2
 
             var tokens = MergeAndMinimizeTokens(rawTokens);
 
-            var packedTokens = new List<(string Token, RoaringishPacked Packed)>();
+            // Use PhraseQuery logic
+            var q = new PhraseQuery(tokens);
+            // SearchAll returns all docIds
+            return SearchAll(q);
+        }
 
-            try
+        public List<(uint DocId, float Score)> Search(Query query, int n)
+        {
+            var results = new List<(uint DocId, float Score)>();
+            if (_packedFile == null) return results;
+
+            using var weight = query.CreateWeight(this, true);
+            using var scorer = weight.GetScorer();
+
+            if (scorer == null) return results;
+
+            var pq = new PriorityQueue<(uint DocId, float Score), float>(n, Comparer<float>.Create((a, b) => a.CompareTo(b)));
+
+            while (scorer.NextDoc() != Scorer.NO_MORE_DOCS)
             {
-                foreach (var token in tokens)
-                {
-                    if (!_tokenStore.TryGet(token, out var offset))
-                    {
-                        // Console.WriteLine($"Token not found: {token}");
-                        return new List<uint>();
-                    }
+                float score = scorer.Score();
+                uint docId = (uint)scorer.DocID();
 
-                    packedTokens.Add((token, LoadPacked(offset)));
+                if (pq.Count < n)
+                {
+                    pq.Enqueue((docId, score), score);
                 }
-
-                if (packedTokens.Count == 1)
+                else
                 {
-                     return packedTokens[0].Packed.GetDocIds();
-                }
-
-                int bestIdx = 0;
-                long minLen = long.MaxValue;
-
-                for (int i = 0; i < packedTokens.Count - 1; i++)
-                {
-                    long len = packedTokens[i].Packed.Length + packedTokens[i+1].Packed.Length;
-                    if (len < minLen)
+                    if (score > pq.Peek().Score)
                     {
-                        minLen = len;
-                        bestIdx = i;
+                        pq.Dequeue();
+                        pq.Enqueue((docId, score), score);
                     }
                 }
-
-                var lhsItem = packedTokens[bestIdx];
-                var rhsItem = packedTokens[bestIdx + 1];
-
-                var result = Intersect(lhsItem.Packed, rhsItem.Packed, 1);
-
-                int leftI = bestIdx - 1;
-                int rightI = bestIdx + 2;
-
-                int resultPhraseLen = 2;
-
-                while (true)
-                {
-                    RoaringishPacked nextLhs = leftI >= 0 ? packedTokens[leftI].Packed : null;
-                    RoaringishPacked nextRhs = rightI < packedTokens.Count ? packedTokens[rightI].Packed : null;
-
-                    if (nextLhs == null && nextRhs == null) break;
-
-                    RoaringishPacked oldResult = result;
-
-                    if (nextLhs != null && (nextRhs == null || nextLhs.Length <= nextRhs.Length))
-                    {
-                        result = Intersect(nextLhs, result, (ushort)resultPhraseLen);
-                        resultPhraseLen++;
-                        leftI--;
-                    }
-                    else
-                    {
-                         result = Intersect(result, nextRhs, 1);
-                         resultPhraseLen++;
-                         rightI++;
-                    }
-
-                    oldResult.Dispose(); // Free intermediate result
-
-                    if (result.Length == 0) break;
-                }
-
-                var docIds = result.GetDocIds();
-                result.Dispose();
-                return docIds;
             }
-            finally
+
+            while(pq.Count > 0)
             {
-                foreach(var pt in packedTokens) pt.Packed.Dispose();
+                results.Add(pq.Dequeue());
             }
+
+            results.Reverse();
+            return results;
+        }
+
+        public List<uint> SearchAll(Query query)
+        {
+            var results = new List<uint>();
+            if (_packedFile == null) return results;
+
+            using var weight = query.CreateWeight(this, false);
+            using var scorer = weight.GetScorer();
+
+            if (scorer == null) return results;
+
+            while (scorer.NextDoc() != Scorer.NO_MORE_DOCS)
+            {
+                results.Add((uint)scorer.DocID());
+            }
+            return results;
         }
 
         public RoaringishPacked Intersect(RoaringishPacked lhs, RoaringishPacked rhs, ushort lhsLenFull)
@@ -342,9 +329,20 @@ namespace SimdPhrase2
 
         public string GetDocument(uint docId) => _docStore.GetDocument(docId);
 
+        internal RoaringishPacked? GetPackedForTerm(string term, out long docCount)
+        {
+            docCount = 0;
+            if (_tokenStore.TryGet(term, out var offset))
+            {
+                docCount = offset.DocCount;
+                return LoadPacked(offset);
+            }
+            return null;
+        }
+
         // --- BM25 Implementation ---
 
-        private int GetDocLength(uint docId)
+        internal int GetDocLength(uint docId)
         {
             if (_docLengthsStream == null) return 0;
             // docLengths is int32 array.
@@ -375,30 +373,13 @@ namespace SimdPhrase2
             }
             if (tokens.Count == 0) return new List<(uint, float)>();
 
-            var scores = new Dictionary<uint, float>();
-            long N = _stats != null ? _indexStats.TotalDocs : 0; // Using _indexStats
-            float avgDocLength = (float)_avgDocLength;
+            var bq = new BooleanQuery();
             foreach(var t in tokens)
             {
-                if (_tokenStore.TryGet(t, out var offset))
-                {
-                     float idf = MathF.Log(1f + (N - offset.DocCount + 0.5f) / (offset.DocCount + 0.5f));
-                     if (idf < 0) idf = 0;
-
-                     using var packed = LoadPacked(offset);
-                     var freqs = packed.GetDocIdsAndFreqs();
-                     foreach(var (docId, tf) in freqs)
-                     {
-                         int docLen = GetDocLength(docId);
-                         float score = idf * (tf * (k1 + 1f)) / (tf + k1 * (1f - b + b * (docLen / avgDocLength)));
-
-                         ref float scoreVal = ref CollectionsMarshal.GetValueRefOrAddDefault(scores, docId, out _);
-                         scoreVal += score;
-                     }
-                }
+                bq.Add(new TermQuery(t), Occur.SHOULD);
             }
 
-            return scores.OrderByDescending(kvp => kvp.Value).Take(k).Select(kvp => (kvp.Key, kvp.Value)).ToList();
+            return Search(bq, k);
         }
 
         // --- Boolean Implementation ---
@@ -408,44 +389,7 @@ namespace SimdPhrase2
              var parser = new BooleanQueryParser();
              var root = parser.Parse(query);
              if (root == null) return new List<uint>();
-             return SearchBoolean(root);
-        }
-
-        public List<uint> SearchBoolean(QueryNode root)
-        {
-             if (root == null) return new List<uint>();
-
-             // Evaluate and sort
-             var results = Evaluate(root);
-             return results.OrderBy(x => x).ToList();
-        }
-
-        private IEnumerable<uint> Evaluate(QueryNode node)
-        {
-            if (node is TermNode t)
-            {
-                 // Use Search() to handle phrase search if term is multiple words?
-                 // Parser produces single words.
-                 // But if we want to support phrases in future, Search() is good.
-                 // Also, Search() handles normalization/tokenization of the term properly.
-                 return Search(t.Term);
-            }
-            if (node is AndNode a)
-            {
-                return Evaluate(a.Left).Intersect(Evaluate(a.Right));
-            }
-            if (node is OrNode o)
-            {
-                return Evaluate(o.Left).Union(Evaluate(o.Right));
-            }
-            if (node is NotNode n)
-            {
-                 // Calculate AllDocs - Child
-                 // We need to materialize child to HashSet for efficient check
-                 var childDocs = new HashSet<uint>(Evaluate(n.Child));
-                 return Enumerable.Range(0, (int)_indexStats.TotalDocs).Select(i => (uint)i).Where(id => !childDocs.Contains(id));
-            }
-            return Enumerable.Empty<uint>();
+             return SearchAll(root);
         }
     }
 }
