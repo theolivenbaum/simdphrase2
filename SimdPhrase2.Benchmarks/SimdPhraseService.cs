@@ -10,17 +10,19 @@ namespace SimdPhrase2.Benchmarks
         private readonly string _indexPath;
         private readonly bool _forceNaive;
         private Searcher _searcher;
+        private readonly ITextTokenizer _tokenizer;
 
-        public SimdPhraseService(string indexPath, bool forceNaive)
+        public SimdPhraseService(string indexPath, bool forceNaive, ITextTokenizer tokenizer = null)
         {
             _indexPath = indexPath;
             _forceNaive = forceNaive;
+            _tokenizer = tokenizer;
         }
 
         public void Index(params IEnumerable<(string content, uint docId)> docs)
         {
             // Indexer clears the directory in constructor
-            using (var indexer = new Indexer(_indexPath, CommonTokensConfig.None))
+            using (var indexer = new Indexer(_indexPath, CommonTokensConfig.None, tokenizer: _tokenizer))
             {
                 indexer.Index(docs);
             }
@@ -30,7 +32,7 @@ namespace SimdPhrase2.Benchmarks
         {
             if (_searcher == null)
             {
-                _searcher = new Searcher(_indexPath, _forceNaive);
+                _searcher = new Searcher(_indexPath, _forceNaive, tokenizer: _tokenizer);
             }
         }
 

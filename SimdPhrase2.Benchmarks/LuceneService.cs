@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using Lucene.Net.Analysis;
 using Lucene.Net.Analysis.Util;
 using Lucene.Net.Analysis.Standard;
+using Lucene.Net.Analysis.NGram;
 using Lucene.Net.Documents;
 using Lucene.Net.Index;
 using Lucene.Net.QueryParsers.Classic;
@@ -17,17 +19,17 @@ namespace SimdPhrase2.Benchmarks
     {
         private readonly string _indexPath;
         private FSDirectory _directory;
-        private StandardAnalyzer _analyzer;
+        private Analyzer _analyzer;
         private IndexWriter _writer;
         private DirectoryReader _reader;
         private IndexSearcher _searcher;
         private bool _useBm25;
 
-        public LuceneService(string indexPath, bool useBm25 = false)
+        public LuceneService(string indexPath, bool useBm25 = false, Analyzer analyzer = null)
         {
             _indexPath = indexPath;
             _directory = FSDirectory.Open(_indexPath);
-            _analyzer = new StandardAnalyzer(LuceneVersion.LUCENE_48, CharArraySet.EMPTY_SET);
+            _analyzer = analyzer ?? new StandardAnalyzer(LuceneVersion.LUCENE_48, CharArraySet.EMPTY_SET);
             _useBm25 = useBm25;
         }
 
@@ -180,6 +182,24 @@ namespace SimdPhrase2.Benchmarks
             _writer?.Dispose();
             _reader?.Dispose();
             _directory?.Dispose();
+        }
+    }
+
+    public class NGramAnalyzer : Analyzer
+    {
+        private readonly int _minGram;
+        private readonly int _maxGram;
+
+        public NGramAnalyzer(int minGram, int maxGram)
+        {
+            _minGram = minGram;
+            _maxGram = maxGram;
+        }
+
+        protected override TokenStreamComponents CreateComponents(string fieldName, TextReader reader)
+        {
+            var tokenizer = new Lucene.Net.Analysis.NGram.NGramTokenizer(LuceneVersion.LUCENE_48, reader, _minGram, _maxGram);
+            return new TokenStreamComponents(tokenizer, tokenizer);
         }
     }
 }
