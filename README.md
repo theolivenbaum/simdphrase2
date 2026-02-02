@@ -60,7 +60,27 @@ AMD Ryzen AI 9 HX 370 w/ Radeon 890M 2.00GHz, 1 CPU, 24 logical and 12 physical 
 | Phrase Len2 | 1,000,000 | 2,835.566        | 294.535        | **9.63×**  |
 | Phrase Len3 | 1,000,000 | 2,532.128        | 220.358        | **11.5×**  |
 
+## NGram Benchmarks
 
+Two additional scenarios test NGram-based tokenization performance:
+
+1.  **Identifier Search (Non-breaking):** 10-digit random numbers. Tests `NGramTokenizer` (3-grams) vs Lucene's `NGramTokenizer`.
+2.  **Text Search (Breaking):** Standard text dataset. Tests `BreakingNGramTokenizer` (3-grams, break on whitespace) vs Lucene's `WhitespaceTokenizer` + `NGramTokenFilter`.
+
+| Scenario   | Method                    | N      | Mean         | Speedup vs Lucene |
+|------------|-------------------------- |------- |-------------:|------------------:|
+| Identifier | Lucene_Search             | 10,000 |  62.264 ms   | -                 |
+| Identifier | SimdPhrase_Search         | 10,000 |   0.937 ms   | **66.4x**         |
+| Identifier | Lucene_Search             | 100,000| 780.546 ms   | -                 |
+| Identifier | SimdPhrase_Search         | 100,000|   1.842 ms   | **423.7x**        |
+| Text Term  | Lucene_Search_Term        | 10,000 | 232.107 ms   | -                 |
+| Text Term  | SimdPhrase_Search_Term    | 10,000 |   3.934 ms   | **59.0x**         |
+| Text Phrase| Lucene_Search_Phrase2     | 10,000 |  82.544 ms   | -                 |
+| Text Phrase| SimdPhrase_Search_Phrase2 | 10,000 |   4.997 ms   | **16.5x**         |
+| Text Term  | Lucene_Search_Term        | 100,000| 2,248.081 ms | -                 |
+| Text Term  | SimdPhrase_Search_Term    | 100,000|    23.042 ms | **97.6x**         |
+| Text Phrase| Lucene_Search_Phrase2     | 100,000| 1,267.550 ms | -                 |
+| Text Phrase| SimdPhrase_Search_Phrase2 | 100,000|    71.745 ms | **17.7x**         |
 
 ### Running Benchmarks
 
@@ -72,6 +92,9 @@ dotnet run -c Release --project SimdPhrase2.Benchmarks/SimdPhrase2.Benchmarks.cs
 
 # Run specific scenarios (e.g. N=10000)
 dotnet run -c Release --project SimdPhrase2.Benchmarks/SimdPhrase2.Benchmarks.csproj -- --filter "*N=10000*"
+
+# Run NGram benchmarks
+dotnet run -c Release --project SimdPhrase2.Benchmarks/SimdPhrase2.Benchmarks.csproj -- --filter "*NGram*"
 
 # Validate hit counts between engines
 dotnet run -c Release --project SimdPhrase2.Benchmarks/SimdPhrase2.Benchmarks.csproj -- validate
