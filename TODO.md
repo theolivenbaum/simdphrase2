@@ -38,18 +38,14 @@ The features are ordered to minimize technical debt and refactoring churn: **Sta
 **Current State:**
 The `Searcher` class is now thread-safe. It uses `RandomAccess.Read` for stateless file reads and ensures read-only access to storage components.
 
-#### 2. Unified Query & Scoring Model
+#### 2. Unified Query & Scoring Model [COMPLETED]
 **Current State:**
-There are two disconnected search paths:
--   `Search(string query)`: Supports Boolean logic and Phrases but returns `List<uint>` (no scoring).
--   `SearchBM25(string query)`: Supports BM25 scoring but has no Boolean support and returns `List<(uint, float)>`.
-Combining them (e.g., "Boolean filter + BM25 ranking") is currently impossible without significant hacks.
-
-**Proposed Implementation:**
--   Create a composable **Query Object Model** (`Query` base class).
--   Implement subclasses: `TermQuery`, `PhraseQuery`, `BooleanQuery`.
--   Implement a `Scorer` / `Weight` iterator pattern (similar to Lucene) to unify matching and scoring into a single pipeline.
--   This refactor is a prerequisite for adding Fields and Segments effectively.
+Implemented a composable **Query Object Model** (`Query`, `Weight`, `Scorer`).
+-   Implemented `TermQuery`, `PhraseQuery`, `BooleanQuery` (MUST, SHOULD, MUST_NOT).
+-   Refactored `Searcher` to use the new model for `Search` and `SearchBM25`.
+-   `PhraseQuery` uses eager intersection (SIMD).
+-   `BooleanQuery` uses iterator/scorer composition.
+-   Fixed bug in `TermScorer` regarding zero-frequency documents.
 
 #### 3. Fielded Indexing and Search
 **Current State:**

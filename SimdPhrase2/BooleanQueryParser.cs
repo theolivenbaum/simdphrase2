@@ -1,47 +1,15 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
+using SimdPhrase2.QueryModel;
 
 namespace SimdPhrase2
 {
-    public abstract class QueryNode { }
-
-    public class TermNode : QueryNode
-    {
-        public string Term { get; set; }
-        public TermNode(string term) => Term = term;
-        public override string ToString() => Term;
-    }
-
-    public class AndNode : QueryNode
-    {
-        public QueryNode Left { get; set; }
-        public QueryNode Right { get; set; }
-        public AndNode(QueryNode left, QueryNode right) { Left = left; Right = right; }
-        public override string ToString() => $"({Left} AND {Right})";
-    }
-
-    public class OrNode : QueryNode
-    {
-        public QueryNode Left { get; set; }
-        public QueryNode Right { get; set; }
-        public OrNode(QueryNode left, QueryNode right) { Left = left; Right = right; }
-        public override string ToString() => $"({Left} OR {Right})";
-    }
-
-    public class NotNode : QueryNode
-    {
-        public QueryNode Child { get; set; }
-        public NotNode(QueryNode child) => Child = child;
-        public override string ToString() => $"(NOT {Child})";
-    }
-
     public class BooleanQueryParser
     {
         private List<string> _tokens;
         private int _pos;
 
-        public QueryNode Parse(string query)
+        public Query Parse(string query)
         {
             _tokens = Tokenize(query);
             _pos = 0;
@@ -76,19 +44,22 @@ namespace SimdPhrase2
             return tokens;
         }
 
-        private QueryNode ParseOr()
+        private Query ParseOr()
         {
             var left = ParseAnd();
             while (_pos < _tokens.Count && _tokens[_pos].Equals("OR", StringComparison.OrdinalIgnoreCase))
             {
                 _pos++;
                 var right = ParseAnd();
-                left = new OrNode(left, right);
+                var bq = new BooleanQuery();
+                bq.Add(left, Occur.SHOULD);
+                bq.Add(right, Occur.SHOULD);
+                left = bq;
             }
             return left;
         }
 
-        private QueryNode ParseAnd()
+        private Query ParseAnd()
         {
             var left = ParseNot();
             while (_pos < _tokens.Count)
@@ -98,7 +69,10 @@ namespace SimdPhrase2
                 {
                     _pos++;
                     var right = ParseNot();
-                    left = new AndNode(left, right);
+                    var bq = new BooleanQuery();
+                    bq.Add(left, Occur.MUST);
+                    bq.Add(right, Occur.MUST);
+                    left = bq;
                 }
                 else if (token.Equals("OR", StringComparison.OrdinalIgnoreCase) || token == ")")
                 {
@@ -108,24 +82,30 @@ namespace SimdPhrase2
                 {
                     // Implicit AND
                     var right = ParseNot();
-                    left = new AndNode(left, right);
+                    var bq = new BooleanQuery();
+                    bq.Add(left, Occur.MUST);
+                    bq.Add(right, Occur.MUST);
+                    left = bq;
                 }
             }
             return left;
         }
 
-        private QueryNode ParseNot()
+        private Query ParseNot()
         {
             if (_pos < _tokens.Count && _tokens[_pos].Equals("NOT", StringComparison.OrdinalIgnoreCase))
             {
                 _pos++;
                 var child = ParseNot();
-                return new NotNode(child);
+                var bq = new BooleanQuery();
+                bq.Add(new MatchAllDocsQuery(), Occur.MUST);
+                bq.Add(child, Occur.MUST_NOT);
+                return bq;
             }
             return ParsePrimary();
         }
 
-        private QueryNode ParsePrimary()
+        private Query ParsePrimary()
         {
             if (_pos >= _tokens.Count) throw new Exception("Unexpected end of query");
 
@@ -139,7 +119,7 @@ namespace SimdPhrase2
             }
 
             var term = _tokens[_pos++];
-            return new TermNode(term);
+            return new TermQuery(term);
         }
     }
 }
