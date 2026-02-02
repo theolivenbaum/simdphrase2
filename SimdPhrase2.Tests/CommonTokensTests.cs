@@ -4,6 +4,7 @@ using System.Linq;
 using System.Collections.Generic;
 using SimdPhrase2;
 using SimdPhrase2.Roaringish;
+using SimdPhrase2.Storage;
 
 namespace SimdPhrase2.Tests
 {
@@ -27,7 +28,7 @@ namespace SimdPhrase2.Tests
             }
 
             // Verify CommonTokens persistence
-            var loadedCommon = CommonTokensPersistence.Load(Path.Combine(indexName, "common_tokens.bin"));
+            var loadedCommon = CommonTokensPersistence.Load(new FileSystemStorage(), Path.Combine(indexName, "common_tokens.bin"));
             Assert.Contains("the", loadedCommon);
             Assert.Contains("is", loadedCommon);
             Assert.Contains("a", loadedCommon);

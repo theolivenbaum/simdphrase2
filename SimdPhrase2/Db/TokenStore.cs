@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using SimdPhrase2.Storage;
 
 namespace SimdPhrase2.Db
 {
@@ -16,18 +17,20 @@ namespace SimdPhrase2.Db
         private readonly string _path;
         private Dictionary<string, FileOffset> _map;
         private bool _dirty;
+        private readonly ISimdStorage _storage;
 
-        public TokenStore(string basePath)
+        public TokenStore(string basePath, ISimdStorage storage = null)
         {
-            _path = Path.Combine(basePath, "token_map.bin");
+            _storage = storage ?? new FileSystemStorage();
+            _path = _storage.Combine(basePath, "token_map.bin");
             _map = new Dictionary<string, FileOffset>();
             Load();
         }
 
         private void Load()
         {
-            if (!File.Exists(_path)) return;
-            using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read);
+            if (!_storage.FileExists(_path)) return;
+            using var fs = _storage.OpenRead(_path);
             using var reader = new BinaryReader(fs);
 
             try
@@ -66,7 +69,7 @@ namespace SimdPhrase2.Db
         public void Save()
         {
             if (!_dirty) return;
-            using var fs = new FileStream(_path, FileMode.Create, FileAccess.Write);
+            using var fs = _storage.OpenWrite(_path);
             using var writer = new BinaryWriter(fs);
 
             writer.Write(_map.Count);

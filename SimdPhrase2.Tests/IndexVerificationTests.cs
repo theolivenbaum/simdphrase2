@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using Xunit;
 using SimdPhrase2.Db;
+using SimdPhrase2.Storage;
 
 namespace SimdPhrase2.Tests
 {
@@ -39,7 +40,7 @@ namespace SimdPhrase2.Tests
             // Verify IndexStats
             var statsPath = Path.Combine(_indexName, "index_stats.json");
             Assert.True(File.Exists(statsPath));
-            var stats = IndexStats.Load(statsPath);
+            var stats = IndexStats.Load(new FileSystemStorage(), statsPath);
             Assert.Equal(3u, stats.TotalDocs);
             Assert.Equal(7ul, stats.TotalTokens);
 
