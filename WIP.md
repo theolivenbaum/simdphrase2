@@ -1,7 +1,7 @@
 # Work In Progress
 
 ## Current Status
-Porting the `SimdPhrase` Rust library to C# is complete.
+Refactoring architecture for production readiness.
 
 ## Completed Tasks
 *   Implemented `Utils` (Tokenizer, Normalizer).
@@ -15,6 +15,7 @@ Porting the `SimdPhrase` Rust library to C# is complete.
 *   Verified with Unit Tests and End-to-End Tests.
 *   Implemented `Gallop` intersection (First and Second pass).
 *   Implemented `CommonTokens` optimization (Indexer merging, Searcher DP).
+*   **Thread-Safe Architecture**: Refactored `Searcher` and `DocumentStore` to use stateless `RandomAccess.Read`, enabling concurrent searches.
 
 ## Next Steps
-*   Performance benchmarking and tuning.
+*   Unified Query & Scoring Model.

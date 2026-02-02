@@ -12,9 +12,9 @@ namespace SimdPhrase2.Tests
         {
             var tokenizer = new BasicTokenizer();
             // "  Hello, World!  " -> "Hello", ",", "World", "!"
-            // Normalization is now enabled by default in BasicTokenizer, so we expect lowercase.
+            // Normalization emits both original (if upper) and lowercased.
             var input = "  Hello, World!  ".AsSpan();
-            var expected = new[] { "hello", ",", "world", "!" };
+            var expected = new[] { "Hello", "hello", ",", "World", "world", "!" };
 
             var result = new List<string>();
             foreach(var t in tokenizer.Tokenize(input))
@@ -47,8 +47,8 @@ namespace SimdPhrase2.Tests
             var inputStr = "The quick brown fox jumps over the lazy dog.";
             var input = inputStr.AsSpan();
 
-            // Expected: "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "."
-            var expected = new[] { "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "." };
+            // Expected: "The", "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "."
+            var expected = new[] { "The", "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "." };
 
             var result = new List<string>();
             foreach(var t in tokenizer.Tokenize(input))
@@ -85,7 +85,7 @@ namespace SimdPhrase2.Tests
             var tokenizer = new BasicTokenizer();
             var input = "UPPER Case".AsSpan();
             // Should be lowercased
-            var expected = new[] { "upper", "case" };
+            var expected = new[] { "UPPER", "upper", "Case", "case" };
 
             var result = new List<string>();
             foreach(var t in tokenizer.Tokenize(input))
@@ -102,7 +102,7 @@ namespace SimdPhrase2.Tests
             var tokenizer = new BasicTokenizer();
             var input = "Crème Brûlée!".AsSpan();
             // "crème", "brûlée", "!"
-            var expected = new[] { "crème", "brûlée", "!" };
+            var expected = new[] { "Crème", "crème", "Brûlée", "brûlée", "!" };
 
             var result = new List<string>();
             foreach(var t in tokenizer.Tokenize(input))
