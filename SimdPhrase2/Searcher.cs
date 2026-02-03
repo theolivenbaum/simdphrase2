@@ -7,6 +7,7 @@ using System.Buffers.Binary;
 using SimdPhrase2.Db;
 using SimdPhrase2.Roaringish;
 using SimdPhrase2.Roaringish.Intersect;
+using SimdPhrase2.Storage;
 
 namespace SimdPhrase2
 {
@@ -15,38 +16,40 @@ namespace SimdPhrase2
         private readonly string _indexName;
         private TokenStore _tokenStore;
         private DocumentStore _docStore;
-        private FileStream? _packedFile;
+        private Stream? _packedFile;
         private IIntersect _intersect;
         private Stats _stats;
         private HashSet<string> _commonTokens;
         private ITextTokenizer _tokenizer;
+        private ISimdStorage _storage;
 
         // BM25 / Boolean support
-        private FileStream? _docLengthsStream;
+        private Stream? _docLengthsStream;
         private IndexStats _indexStats;
         private float _avgDocLength;
 
-        public Searcher(string indexName, bool forceNaive = false, ITextTokenizer tokenizer = null)
+        public Searcher(string indexName, bool forceNaive = false, ITextTokenizer tokenizer = null, ISimdStorage storage = null)
         {
             _indexName = indexName;
             _tokenizer = tokenizer ?? new BasicTokenizer();
-            _tokenStore = new TokenStore(indexName);
-            _docStore = new DocumentStore(indexName);
-            string packedPath = Path.Combine(indexName, "roaringish_packed.bin");
-            if (File.Exists(packedPath))
+            _storage = storage ?? new FileSystemStorage();
+            _tokenStore = new TokenStore(indexName, _storage);
+            _docStore = new DocumentStore(indexName, _storage);
+            string packedPath = _storage.Combine(indexName, "roaringish_packed.bin");
+            if (_storage.FileExists(packedPath))
             {
-                _packedFile = File.OpenRead(packedPath);
+                _packedFile = _storage.OpenRead(packedPath);
             }
             _intersect = forceNaive ? new NaiveIntersect() :  new SimdIntersect();
             _stats = new Stats();
-            _commonTokens = CommonTokensPersistence.Load(Path.Combine(indexName, "common_tokens.bin"));
+            _commonTokens = CommonTokensPersistence.Load(_storage, _storage.Combine(indexName, "common_tokens.bin"));
 
-            string docLengthsPath = Path.Combine(indexName, "doc_lengths.bin");
-            if (File.Exists(docLengthsPath))
-                _docLengthsStream = File.OpenRead(docLengthsPath);
+            string docLengthsPath = _storage.Combine(indexName, "doc_lengths.bin");
+            if (_storage.FileExists(docLengthsPath))
+                _docLengthsStream = _storage.OpenRead(docLengthsPath);
 
-            string statsPath = Path.Combine(indexName, "index_stats.json");
-            _indexStats = IndexStats.Load(statsPath);
+            string statsPath = _storage.Combine(indexName, "index_stats.json");
+            _indexStats = IndexStats.Load(_storage, statsPath);
             if (_indexStats.TotalDocs > 0)
                 _avgDocLength = (float)_indexStats.TotalTokens / _indexStats.TotalDocs;
         }

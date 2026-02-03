@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using SimdPhrase2.Storage;
 
 namespace SimdPhrase2
 {
@@ -34,9 +35,9 @@ namespace SimdPhrase2
 
     public static class CommonTokensPersistence
     {
-        public static void Save(string path, HashSet<string> tokens)
+        public static void Save(ISimdStorage storage, string path, HashSet<string> tokens)
         {
-            using var fs = new FileStream(path, FileMode.Create);
+            using var fs = storage.OpenWrite(path);
             using var writer = new BinaryWriter(fs);
             writer.Write(tokens.Count);
             foreach (var token in tokens)
@@ -45,12 +46,12 @@ namespace SimdPhrase2
             }
         }
 
-        public static HashSet<string> Load(string path)
+        public static HashSet<string> Load(ISimdStorage storage, string path)
         {
             var tokens = new HashSet<string>();
-            if (!File.Exists(path)) return tokens;
+            if (!storage.FileExists(path)) return tokens;
 
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+            using var fs = storage.OpenRead(path);
             using var reader = new BinaryReader(fs);
 
             try

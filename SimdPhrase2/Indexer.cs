@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Buffers.Binary;
 using SimdPhrase2.Db;
 using SimdPhrase2.Roaringish;
+using SimdPhrase2.Storage;
 
 namespace SimdPhrase2
 {
@@ -23,18 +24,20 @@ namespace SimdPhrase2
         private List<(string content, uint docId)> _firstBatchBuffer;
         private bool _isFirstBatch;
         private ITextTokenizer _tokenizer;
+        private ISimdStorage _storage;
 
         // Stats
         private uint _totalDocs;
         private ulong _totalTokens;
-        private FileStream _docLengthsStream;
+        private Stream _docLengthsStream;
         private readonly object _lock = new object();
 
-        public Indexer(string indexName, CommonTokensConfig commonTokensConfig = null, int batchSize = 300_000, ITextTokenizer tokenizer = null)
+        public Indexer(string indexName, CommonTokensConfig commonTokensConfig = null, int batchSize = 300_000, ITextTokenizer tokenizer = null, ISimdStorage storage = null)
         {
             _indexName = indexName;
             _batchSize = batchSize;
             _tokenizer = tokenizer ?? new BasicTokenizer();
+            _storage = storage ?? new FileSystemStorage();
             _commonTokensConfig = commonTokensConfig ?? CommonTokensConfig.None;
             _currentBatch = new Dictionary<string, RoaringishPacked>();
             _currentBatchCount = 0;
@@ -44,11 +47,11 @@ namespace SimdPhrase2
             _isFirstBatch = true;
             _commonTokens = new HashSet<string>();
 
-            if (Directory.Exists(_indexName)) Directory.Delete(_indexName, true);
-            Directory.CreateDirectory(_indexName);
+            if (_storage.DirectoryExists(_indexName)) _storage.DeleteDirectory(_indexName);
+            _storage.CreateDirectory(_indexName);
 
-            _docStore = new DocumentStore(_indexName);
-            _docLengthsStream = new FileStream(Path.Combine(_indexName, "doc_lengths.bin"), FileMode.Create, FileAccess.ReadWrite, FileShare.Read);
+            _docStore = new DocumentStore(_indexName, _storage);
+            _docLengthsStream = _storage.OpenReadWrite(_storage.Combine(_indexName, "doc_lengths.bin"));
             _totalDocs = 0;
             _totalTokens = 0;
         }
@@ -229,7 +232,7 @@ namespace SimdPhrase2
 
             if (_commonTokens.Count > 0)
             {
-                CommonTokensPersistence.Save(Path.Combine(_indexName, "common_tokens.bin"), _commonTokens);
+                CommonTokensPersistence.Save(_storage, _storage.Combine(_indexName, "common_tokens.bin"), _commonTokens);
             }
         }
 
@@ -250,8 +253,8 @@ namespace SimdPhrase2
 
             Console.WriteLine($"Flushing batch {_batchId} with {_currentBatchCount} docs and {_currentBatch.Count} unique tokens.");
 
-            string tempFile = Path.Combine(_indexName, $"batch_{_batchId}.bin");
-            using (var fs = new FileStream(tempFile, FileMode.Create))
+            string tempFile = _storage.Combine(_indexName, $"batch_{_batchId}.bin");
+            using (var fs = _storage.OpenWrite(tempFile))
             using (var writer = new BinaryWriter(fs))
             {
                 var sortedTokens = _currentBatch.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList();
@@ -287,7 +290,7 @@ namespace SimdPhrase2
                 TotalDocs = _totalDocs,
                 TotalTokens = _totalTokens
             };
-            IndexStats.Save(Path.Combine(_indexName, "index_stats.json"), stats);
+            IndexStats.Save(_storage, _storage.Combine(_indexName, "index_stats.json"), stats);
         }
 
         private void MergeBatches()
@@ -299,8 +302,8 @@ namespace SimdPhrase2
             var readers = new List<BatchReader>();
             for (int i = 0; i < _batchId; i++)
             {
-                string path = Path.Combine(_indexName, $"batch_{i}.bin");
-                readers.Add(new BatchReader(path, i));
+                string path = _storage.Combine(_indexName, $"batch_{i}.bin");
+                readers.Add(new BatchReader(_storage, path, i));
             }
 
             var pq = new PriorityQueue<BatchReader, (string, int)>(Comparer<(string, int)>.Create((a, b) =>
@@ -316,8 +319,8 @@ namespace SimdPhrase2
                     pq.Enqueue(r, (r.CurrentToken, r.BatchIndex));
             }
 
-            using var tokenStore = new TokenStore(_indexName);
-            using var packedFile = new FileStream(Path.Combine(_indexName, "roaringish_packed.bin"), FileMode.Create);
+            using var tokenStore = new TokenStore(_indexName, _storage);
+            using var packedFile = _storage.OpenWrite(_storage.Combine(_indexName, "roaringish_packed.bin"));
 
             while (pq.Count > 0)
             {
@@ -375,7 +378,7 @@ namespace SimdPhrase2
 
             for (int i = 0; i < _batchId; i++)
             {
-                File.Delete(Path.Combine(_indexName, $"batch_{i}.bin"));
+                _storage.DeleteFile(_storage.Combine(_indexName, $"batch_{i}.bin"));
             }
         }
 
@@ -402,16 +405,16 @@ namespace SimdPhrase2
 
         private class BatchReader : IDisposable
         {
-            private FileStream _fs;
+            private Stream _fs;
             private BinaryReader _br;
             public string CurrentToken;
             public byte[] CurrentData;
             public bool Finished;
             public int BatchIndex;
 
-            public BatchReader(string path, int index)
+            public BatchReader(ISimdStorage storage, string path, int index)
             {
-                _fs = File.OpenRead(path);
+                _fs = storage.OpenRead(path);
                 _br = new BinaryReader(_fs);
                 BatchIndex = index;
                 Next();

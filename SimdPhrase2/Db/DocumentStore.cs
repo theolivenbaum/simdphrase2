@@ -2,23 +2,26 @@ using System;
 using System.IO;
 using System.Text;
 using System.Buffers.Binary;
+using SimdPhrase2.Storage;
 
 namespace SimdPhrase2.Db
 {
     public class DocumentStore : IDisposable
     {
-        private readonly FileStream _offsetsStream;
-        private readonly FileStream _dataStream;
+        private readonly Stream _offsetsStream;
+        private readonly Stream _dataStream;
         private readonly object _lock = new object();
+        private readonly ISimdStorage _storage;
 
-        public DocumentStore(string basePath)
+        public DocumentStore(string basePath, ISimdStorage storage = null)
         {
-            string offsetsPath = Path.Combine(basePath, "doc_offsets.bin");
-            string dataPath = Path.Combine(basePath, "documents.bin");
-            Directory.CreateDirectory(basePath);
+            _storage = storage ?? new FileSystemStorage();
+            string offsetsPath = _storage.Combine(basePath, "doc_offsets.bin");
+            string dataPath = _storage.Combine(basePath, "documents.bin");
+            _storage.CreateDirectory(basePath);
 
-            _offsetsStream = new FileStream(offsetsPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
-            _dataStream = new FileStream(dataPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+            _offsetsStream = _storage.OpenReadWrite(offsetsPath);
+            _dataStream = _storage.OpenReadWrite(dataPath);
         }
 
         public void AddDocument(uint docId, string content)
