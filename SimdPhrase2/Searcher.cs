@@ -31,7 +31,7 @@ namespace SimdPhrase2
             _indexName = indexName;
             _tokenizer = tokenizer ?? new BasicTokenizer();
             _tokenStore = new TokenStore(indexName);
-            _docStore = new DocumentStore(indexName, readOnly: true);
+            _docStore = new DocumentStore(indexName);
             string packedPath = Path.Combine(indexName, "roaringish_packed.bin");
             if (File.Exists(packedPath))
             {
@@ -49,18 +49,6 @@ namespace SimdPhrase2
             _indexStats = IndexStats.Load(statsPath);
             if (_indexStats.TotalDocs > 0)
                 _avgDocLength = (float)_indexStats.TotalTokens / _indexStats.TotalDocs;
-        }
-
-        private static void ReadExactlyAtOffset(FileStream fs, Span<byte> buffer, long offset)
-        {
-            int totalRead = 0;
-            while (totalRead < buffer.Length)
-            {
-                int read = RandomAccess.Read(fs.SafeFileHandle, buffer.Slice(totalRead), offset + totalRead);
-                if (read == 0)
-                    throw new EndOfStreamException();
-                totalRead += read;
-            }
         }
 
         private List<string> MergeAndMinimizeTokens(List<string> tokens)
@@ -152,8 +140,10 @@ namespace SimdPhrase2
              var buffer = new AlignedBuffer<ulong>(ulongCount);
              buffer.SetLength(ulongCount);
 
+             _packedFile.Seek(offset.Begin, SeekOrigin.Begin);
+
              Span<byte> byteSpan = MemoryMarshal.Cast<ulong, byte>(buffer.AsSpan());
-             ReadExactlyAtOffset(_packedFile!, byteSpan, offset.Begin);
+             _packedFile.ReadExactly(byteSpan);
 
              return new RoaringishPacked(buffer, takeOwnership: true);
         }
@@ -351,17 +341,11 @@ namespace SimdPhrase2
             long pos = (long)docId * 4;
             if (pos >= _docLengthsStream.Length) return 0;
 
+            _docLengthsStream.Seek(pos, SeekOrigin.Begin);
             Span<byte> buffer = stackalloc byte[4];
-            // Read exactly 4 bytes
-            try
-            {
-                ReadExactlyAtOffset(_docLengthsStream, buffer, pos);
-                return BinaryPrimitives.ReadInt32LittleEndian(buffer);
-            }
-            catch(EndOfStreamException)
-            {
-                return 0;
-            }
+            int read = _docLengthsStream.Read(buffer);
+            if (read < 4) return 0;
+            return BinaryPrimitives.ReadInt32LittleEndian(buffer);
         }
 
         public List<(uint DocId, float Score)> SearchBM25(string query, int k = 10, float k1 = 1.2f, float b = 0.75f)

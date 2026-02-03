@@ -23,7 +23,7 @@ Based on a review of the current `SimdPhrase2` implementation, the following fea
 
 The features are ordered to minimize technical debt and refactoring churn: **Stability -> Architecture -> Schema -> Scalability**.
 
-1.  **Thread-Safe Architecture** (Foundation) [COMPLETED]
+1.  **Thread-Safe Architecture** (Foundation)
 2.  **Unified Query & Scoring Model** (Refactoring)
 3.  **Fielded Indexing and Search** (Schema)
 4.  **Segmented Architecture** (Scalability/Storage)
@@ -34,9 +34,14 @@ The features are ordered to minimize technical debt and refactoring churn: **Sta
 
 ### Detailed Analysis
 
-#### 1. Thread-Safe Architecture (Critical) [COMPLETED]
+#### 1. Thread-Safe Architecture (Critical)
 **Current State:**
-The `Searcher` class is now thread-safe. It uses `RandomAccess.Read` for stateless file reads and ensures read-only access to storage components.
+The `Searcher` class is **not thread-safe**. It relies on a shared `FileStream` (`_packedFile`) and performs stateful `Seek()` operations before reading. This prevents a single `Searcher` instance from serving concurrent requests in a web server environment (e.g., ASP.NET Core) without heavy external locking.
+
+**Proposed Implementation:**
+-   Switch from `FileStream.Seek() + Read()` to `RandomAccess.Read()` (stateless file reads).
+-   Alternatively, implement a resource pool for `Searcher` instances or file handles.
+-   Ensure `TokenStore` and internal dictionaries are accessed safely (mostly read-only during search).
 
 #### 2. Unified Query & Scoring Model
 **Current State:**

@@ -47,7 +47,7 @@ namespace SimdPhrase2
             if (Directory.Exists(_indexName)) Directory.Delete(_indexName, true);
             Directory.CreateDirectory(_indexName);
 
-            _docStore = new DocumentStore(_indexName, readOnly: false);
+            _docStore = new DocumentStore(_indexName);
             _docLengthsStream = new FileStream(Path.Combine(_indexName, "doc_lengths.bin"), FileMode.Create, FileAccess.ReadWrite, FileShare.Read);
             _totalDocs = 0;
             _totalTokens = 0;
