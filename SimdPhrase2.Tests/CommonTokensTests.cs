@@ -27,8 +27,10 @@ namespace SimdPhrase2.Tests
                 indexer.Commit();
             }
 
-            // Verify CommonTokens persistence
-            var loadedCommon = CommonTokensPersistence.Load(new FileSystemStorage(), Path.Combine(indexName, "common_tokens.bin"));
+            // Verify CommonTokens persistence (now per-segment).
+            var segmentDirs = Directory.GetDirectories(Path.Combine(indexName, "segments"));
+            Assert.Single(segmentDirs);
+            var loadedCommon = CommonTokensPersistence.Load(new FileSystemStorage(), Path.Combine(segmentDirs[0], "common_tokens.bin"));
             Assert.Contains("the", loadedCommon);
             Assert.Contains("is", loadedCommon);
             Assert.Contains("a", loadedCommon);

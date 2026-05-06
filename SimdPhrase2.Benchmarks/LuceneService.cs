@@ -33,6 +33,18 @@ namespace SimdPhrase2.Benchmarks
             _useBm25 = useBm25;
         }
 
+        public void DeleteByIds(IEnumerable<uint> ids)
+        {
+            var config = new IndexWriterConfig(LuceneVersion.LUCENE_48, _analyzer);
+            config.OpenMode = OpenMode.APPEND;
+            using var writer = new IndexWriter(_directory, config);
+            foreach (var id in ids)
+            {
+                writer.DeleteDocuments(new Lucene.Net.Index.Term("id", id.ToString()));
+            }
+            writer.Commit();
+        }
+
         public void Index(IEnumerable<(string content, uint docId)> docs)
         {
             var config = new IndexWriterConfig(LuceneVersion.LUCENE_48, _analyzer);
