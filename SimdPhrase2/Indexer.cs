@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Buffers.Binary;
 using SimdPhrase2.Db;
 using SimdPhrase2.Roaringish;
+using SimdPhrase2.Segments;
 using SimdPhrase2.Storage;
 
 namespace SimdPhrase2
@@ -16,7 +17,10 @@ namespace SimdPhrase2
         private readonly int _batchSize;
         private int _currentBatchCount;
         private Dictionary<string, RoaringishPacked> _currentBatch;
-        private int _batchId;
+        // List of staged batch files spilled to disk during this commit (only filled
+        // when one commit produces more than _batchSize docs).
+        private List<string> _stagedBatchFiles;
+        private int _spillId;
         private DocumentStore _docStore;
 
         private CommonTokensConfig _commonTokensConfig;
@@ -26,13 +30,23 @@ namespace SimdPhrase2
         private ITextTokenizer _tokenizer;
         private ISimdStorage _storage;
 
-        // Stats
+        // Segments
+        private SegmentManifest _manifest;
+        private TieredMergePolicy _mergePolicy;
+
+        // Stats (global - aggregated across segments)
         private uint _totalDocs;
         private ulong _totalTokens;
         private Stream _docLengthsStream;
         private readonly object _lock = new object();
 
-        public Indexer(string indexName, CommonTokensConfig commonTokensConfig = null, int batchSize = 300_000, ITextTokenizer tokenizer = null, ISimdStorage storage = null)
+        // Pending deletes for this commit. Deletes are applied to existing segments
+        // when Commit() is called (the docId is added to that segment's deletes
+        // bitmap; deletes for docs added in this same commit are applied to the new
+        // segment before it is sealed).
+        private readonly HashSet<uint> _pendingDeletes = new();
+
+        public Indexer(string indexName, CommonTokensConfig commonTokensConfig = null, int batchSize = 300_000, ITextTokenizer tokenizer = null, ISimdStorage storage = null, TieredMergePolicy mergePolicy = null)
         {
             _indexName = indexName;
             _batchSize = batchSize;
@@ -41,19 +55,37 @@ namespace SimdPhrase2
             _commonTokensConfig = commonTokensConfig ?? CommonTokensConfig.None;
             _currentBatch = new Dictionary<string, RoaringishPacked>();
             _currentBatchCount = 0;
-            _batchId = 0;
+            _stagedBatchFiles = new List<string>();
+            _spillId = 0;
+            _mergePolicy = mergePolicy ?? new TieredMergePolicy();
 
             _firstBatchBuffer = new List<(string, uint)>();
             _isFirstBatch = true;
             _commonTokens = new HashSet<string>();
 
-            if (_storage.DirectoryExists(_indexName)) _storage.DeleteDirectory(_indexName);
+            // Important: do NOT delete the index directory here. That breaks the
+            // segmented model. New documents are appended as new segments. Callers
+            // who need a clean index should remove the directory themselves.
             _storage.CreateDirectory(_indexName);
+            _storage.CreateDirectory(_storage.Combine(_indexName, "segments"));
 
             _docStore = new DocumentStore(_indexName, _storage);
             _docLengthsStream = _storage.OpenReadWrite(_storage.Combine(_indexName, "doc_lengths.bin"));
-            _totalDocs = 0;
-            _totalTokens = 0;
+
+            _manifest = SegmentManifest.Load(_storage, _indexName);
+            var statsPath = _storage.Combine(_indexName, "index_stats.json");
+            var existing = IndexStats.Load(_storage, statsPath);
+            _totalDocs = existing.TotalDocs;
+            _totalTokens = existing.TotalTokens;
+
+            // If we already have content (from a previous run), the first batch
+            // logic for common tokens should be skipped - the existing common token
+            // dictionary applies.
+            if (_manifest.Segments.Count > 0)
+            {
+                _isFirstBatch = false;
+                _commonTokens = CommonTokensPersistence.Load(_storage, _storage.Combine(_indexName, "common_tokens.bin"));
+            }
         }
 
         public void Index(IEnumerable<(string content, uint docId)> docs)
@@ -76,7 +108,7 @@ namespace SimdPhrase2
 
                 if (_currentBatchCount >= _batchSize)
                 {
-                    FlushBatch();
+                    SpillBatch();
                 }
             }
             else
@@ -85,25 +117,30 @@ namespace SimdPhrase2
                 _currentBatchCount++;
                 if (_currentBatchCount >= _batchSize)
                 {
-                    FlushBatch();
+                    SpillBatch();
                 }
             }
         }
 
+        // Mark a doc id as deleted. The actual deletion is recorded against existing
+        // segments (or the in-progress segment) on the next Commit().
+        public void Delete(uint docId)
+        {
+            _pendingDeletes.Add(docId);
+        }
+
         private void IndexDocumentInternal(string content, uint docId)
         {
-            // Tokenizer returns spans; normalization is handled by the tokenizer
-            var tokens       = new List<(string token, uint index)>();
+            var tokens = new List<(string token, uint index)>();
 
             var enumerator = _tokenizer.Tokenize(content.AsSpan()).GetEnumerator();
-            
             int tokensCount = 0;
             uint lastIndex = uint.MaxValue;
 
             while (enumerator.MoveNext())
             {
                 tokens.Add((enumerator.Current.ToString(), enumerator.CurrentIndex));
-                if(enumerator.CurrentIndex != lastIndex)
+                if (enumerator.CurrentIndex != lastIndex)
                 {
                     tokensCount++;
                 }
@@ -119,12 +156,7 @@ namespace SimdPhrase2
                 var token = tokens[i];
 
                 ref List<uint> list = ref CollectionsMarshal.GetValueRefOrAddDefault(docTokens, token.token, out var exists);
-                
-                if (!exists)
-                {
-                    list = new List<uint>();
-                }
-                
+                if (!exists) list = new List<uint>();
                 list.Add(token.index);
 
                 if (_commonTokens.Count > 0)
@@ -136,26 +168,15 @@ namespace SimdPhrase2
                     for (int j = 1; j < maxWindow && (i + j) < tokens.Count; j++)
                     {
                         var nextToken = tokens[i + j];
-
-                        if (nextToken.index == token.index)
-                        {
-                            maxWindow++;
-                            continue;
-                        }
+                        if (nextToken.index == token.index) { maxWindow++; continue; }
 
                         bool isNextRare = !_commonTokens.Contains(nextToken.token);
-
                         if (isFirstRare && isNextRare) break;
 
                         currentMerged += " " + nextToken;
 
                         list = ref CollectionsMarshal.GetValueRefOrAddDefault(docTokens, currentMerged, out exists);
-
-                        if (!exists)
-                        {
-                            list = new List<uint>();
-                        }
-
+                        if (!exists) list = new List<uint>();
                         list.Add(token.index);
 
                         if (isNextRare) break;
@@ -176,13 +197,11 @@ namespace SimdPhrase2
 
         private void UpdateStats(uint docId, int docLen)
         {
-            // Update stats
             lock (_lock)
             {
-                _totalDocs++; // This assumes we add unique documents.
+                _totalDocs++;
                 _totalTokens += (ulong)docLen;
 
-                // Write doc length (random access to support out-of-order if needed, though usually sequential)
                 long pos = (long)docId * 4;
                 if (pos != _docLengthsStream.Position)
                 {
@@ -236,7 +255,9 @@ namespace SimdPhrase2
             }
         }
 
-        private void FlushBatch()
+        // Spill current in-memory batch to a temporary file in the index root. Used
+        // when the in-memory dictionary grows past _batchSize during a single commit.
+        private void SpillBatch()
         {
             if (_isFirstBatch)
             {
@@ -251,22 +272,17 @@ namespace SimdPhrase2
 
             if (_currentBatch.Count == 0) return;
 
-            Console.WriteLine($"Flushing batch {_batchId} with {_currentBatchCount} docs and {_currentBatch.Count} unique tokens.");
-
-            string tempFile = _storage.Combine(_indexName, $"batch_{_batchId}.bin");
+            string tempFile = _storage.Combine(_indexName, $"batch_spill_{_spillId}.bin");
             using (var fs = _storage.OpenWrite(tempFile))
             using (var writer = new BinaryWriter(fs))
             {
                 var sortedTokens = _currentBatch.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList();
-
                 foreach (var token in sortedTokens)
                 {
                     var packed = _currentBatch[token];
                     writer.Write(token);
-
                     var span = packed.AsSpan();
                     writer.Write(packed.Length);
-
                     byte[] bytes = new byte[packed.Length * 8];
                     MemoryMarshal.Cast<ulong, byte>(span).CopyTo(bytes);
                     writer.Write(bytes);
@@ -275,16 +291,160 @@ namespace SimdPhrase2
 
             foreach (var p in _currentBatch.Values) p.Dispose();
             _currentBatch.Clear();
-            _currentBatchCount = 0;
-            _batchId++;
+            _stagedBatchFiles.Add(tempFile);
+            _spillId++;
         }
 
         public void Commit()
         {
-            FlushBatch();
-            MergeBatches();
+            // Commit produces 0 or 1 new segment from this commit's writes, then
+            // applies pending deletes against the existing segments, then runs the
+            // merge policy.
+            FlushBatchToSegment();
+            ApplyPendingDeletes();
+            RunAutoMerge();
+            PersistGlobalState();
+        }
 
-            // Save Stats
+        private void FlushBatchToSegment()
+        {
+            // First-batch logic: if this is still the first batch, materialize it now.
+            if (_isFirstBatch)
+            {
+                GenerateCommonTokens();
+                foreach (var (content, docId) in _firstBatchBuffer)
+                {
+                    IndexDocumentInternal(content, docId);
+                }
+                _firstBatchBuffer.Clear();
+                _isFirstBatch = false;
+            }
+
+            bool hasInMemory = _currentBatch.Count > 0;
+            bool hasStaged = _stagedBatchFiles.Count > 0;
+            if (!hasInMemory && !hasStaged) return;
+
+            string segId = _manifest.AllocateSegmentId();
+            int docsInSegment = _currentBatchCount;
+
+            var info = SegmentWriter.Write(_storage, _indexName, segId, _currentBatch, _stagedBatchFiles);
+            info.Id = segId;
+            info.DocCount = docsInSegment;
+
+            _manifest.Segments.Add(info);
+
+            // Cleanup spill files and in-memory state.
+            foreach (var p in _currentBatch.Values) p.Dispose();
+            _currentBatch.Clear();
+            foreach (var f in _stagedBatchFiles) _storage.DeleteFile(f);
+            _stagedBatchFiles.Clear();
+            _spillId = 0;
+            _currentBatchCount = 0;
+        }
+
+        private void ApplyPendingDeletes()
+        {
+            if (_pendingDeletes.Count == 0) return;
+
+            // For every segment, OR only the deletes that actually correspond to docs
+            // in that segment (cheap probe via the per-segment LiveDocIds bitmap).
+            // This keeps DeleteCount accurate so the merge policy doesn't fire on
+            // phantom deletes.
+            foreach (var seg in _manifest.Segments)
+            {
+                using var sr = new SegmentReader(_storage, _indexName, seg);
+                var bm = sr.Deletes;
+                int newDeletes = 0;
+                foreach (var d in _pendingDeletes)
+                {
+                    if (!sr.LiveDocIds.Contains(d)) continue;
+                    if (bm.Add(d)) newDeletes++;
+                }
+                if (newDeletes == 0) continue;
+                string path = _storage.Combine(SegmentManifest.SegmentDirectory(_storage, _indexName, seg.Id), "deletes.bin");
+                using var s = _storage.OpenWrite(path);
+                bm.Save(s);
+                seg.DeleteCount += newDeletes;
+            }
+            _pendingDeletes.Clear();
+        }
+
+        private void RunAutoMerge()
+        {
+            // Cascade merges: keep merging while the policy finds work.
+            for (int safety = 0; safety < 100; safety++)
+            {
+                var todo = _mergePolicy.FindMerge(_manifest.Segments);
+                if (todo == null) break;
+                if (todo.Count == 1)
+                {
+                    // Singleton compaction - just rewrite to drop deletes.
+                    MergeSegments(todo);
+                }
+                else
+                {
+                    MergeSegments(todo);
+                }
+            }
+        }
+
+        // Force-merge to a single segment.
+        public void ForceMerge()
+        {
+            // First, flush any staged docs.
+            if (_currentBatch.Count > 0 || _stagedBatchFiles.Count > 0 || _isFirstBatch && _firstBatchBuffer.Count > 0 || _pendingDeletes.Count > 0)
+            {
+                Commit();
+            }
+            var todo = _mergePolicy.FindForceMerge(_manifest.Segments);
+            if (todo == null) return;
+            MergeSegments(todo);
+            PersistGlobalState();
+        }
+
+        private void MergeSegments(List<SegmentInfo> sources)
+        {
+            string newId = _manifest.AllocateSegmentId();
+            var sourceReaders = new List<SegmentReader>(sources.Count);
+            try
+            {
+                foreach (var s in sources)
+                {
+                    sourceReaders.Add(new SegmentReader(_storage, _indexName, s));
+                }
+                var newInfo = SegmentWriter.Merge(_storage, _indexName, newId, sourceReaders);
+                newInfo.Id = newId;
+                // DocCount is set by SegmentWriter from the actual emitted unique doc ids.
+                newInfo.DeleteCount = 0;
+                newInfo.MergedSegment = true;
+
+                // Insert the new segment, remove the old ones.
+                foreach (var s in sources) _manifest.Segments.Remove(s);
+                _manifest.Segments.Add(newInfo);
+            }
+            finally
+            {
+                foreach (var sr in sourceReaders) sr.Dispose();
+            }
+
+            // Delete files of merged-away segments.
+            foreach (var s in sources)
+            {
+                var dir = SegmentManifest.SegmentDirectory(_storage, _indexName, s.Id);
+                _storage.DeleteFile(_storage.Combine(dir, "roaringish_packed.bin"));
+                _storage.DeleteFile(_storage.Combine(dir, "token_map.bin"));
+                _storage.DeleteFile(_storage.Combine(dir, "deletes.bin"));
+                _storage.DeleteFile(_storage.Combine(dir, "doc_ids.bin"));
+                _storage.DeleteDirectory(dir);
+            }
+        }
+
+        private void PersistGlobalState()
+        {
+            // Save manifest
+            _manifest.Save(_storage, _indexName);
+            // Save aggregated stats - reflect live docs.
+            // _totalDocs and _totalTokens are tracked in-memory; we persist them.
             var stats = new IndexStats
             {
                 TotalDocs = _totalDocs,
@@ -293,159 +453,11 @@ namespace SimdPhrase2
             IndexStats.Save(_storage, _storage.Combine(_indexName, "index_stats.json"), stats);
         }
 
-        private void MergeBatches()
-        {
-            if (_batchId == 0) return;
-
-            Console.WriteLine("Merging batches...");
-
-            var readers = new List<BatchReader>();
-            for (int i = 0; i < _batchId; i++)
-            {
-                string path = _storage.Combine(_indexName, $"batch_{i}.bin");
-                readers.Add(new BatchReader(_storage, path, i));
-            }
-
-            var pq = new PriorityQueue<BatchReader, (string, int)>(Comparer<(string, int)>.Create((a, b) =>
-            {
-                int cmp = string.CompareOrdinal(a.Item1, b.Item1);
-                if (cmp != 0) return cmp;
-                return a.Item2.CompareTo(b.Item2);
-            }));
-
-            foreach (var r in readers)
-            {
-                if (!r.Finished)
-                    pq.Enqueue(r, (r.CurrentToken, r.BatchIndex));
-            }
-
-            using var tokenStore = new TokenStore(_indexName, _storage);
-            using var packedFile = _storage.OpenWrite(_storage.Combine(_indexName, "roaringish_packed.bin"));
-
-            while (pq.Count > 0)
-            {
-                var reader = pq.Dequeue();
-                string token = reader.CurrentToken;
-
-                // Align file position to 64 bytes
-                long currentPos = packedFile.Position;
-                long alignedPos = (currentPos + 63) & ~63;
-                if (alignedPos > currentPos)
-                {
-                    packedFile.Write(new byte[alignedPos - currentPos]);
-                }
-
-                long startOffset = packedFile.Position;
-                long totalLength = 0;
-                int docCount = 0;
-                uint lastDocId = uint.MaxValue; // sentinel
-
-                // Process first segment
-                {
-                    var data = reader.CurrentData;
-                    packedFile.Write(data);
-                    totalLength += data.Length;
-
-                    // Count unique docs
-                    CountDocsInPacked(data, ref lastDocId, ref docCount);
-                }
-
-                reader.Next();
-                if (!reader.Finished)
-                    pq.Enqueue(reader, (reader.CurrentToken, reader.BatchIndex));
-
-                // Process subsequent segments for same token
-                while (pq.Count > 0 && pq.Peek().CurrentToken == token)
-                {
-                    var nextReader = pq.Dequeue();
-                    var data = nextReader.CurrentData;
-
-                    packedFile.Write(data);
-                    totalLength += data.Length;
-
-                    // Count unique docs
-                    CountDocsInPacked(data, ref lastDocId, ref docCount);
-
-                    nextReader.Next();
-                    if (!nextReader.Finished)
-                        pq.Enqueue(nextReader, (nextReader.CurrentToken, nextReader.BatchIndex));
-                }
-
-                tokenStore.Add(token, startOffset, totalLength, docCount);
-            }
-
-            foreach (var r in readers) r.Dispose();
-
-            for (int i = 0; i < _batchId; i++)
-            {
-                _storage.DeleteFile(_storage.Combine(_indexName, $"batch_{i}.bin"));
-            }
-        }
-
-        private void CountDocsInPacked(byte[] data, ref uint lastDocId, ref int docCount)
-        {
-            var span = MemoryMarshal.Cast<byte, ulong>(data);
-            for (int i = 0; i < span.Length; i++)
-            {
-                uint docId = RoaringishPacked.UnpackDocId(span[i]);
-                if (docId != lastDocId)
-                {
-                    docCount++;
-                    lastDocId = docId;
-                }
-            }
-        }
-
         public void Dispose()
         {
             foreach (var p in _currentBatch.Values) p.Dispose();
             _docStore.Dispose();
             _docLengthsStream?.Dispose();
-        }
-
-        private class BatchReader : IDisposable
-        {
-            private Stream _fs;
-            private BinaryReader _br;
-            public string CurrentToken;
-            public byte[] CurrentData;
-            public bool Finished;
-            public int BatchIndex;
-
-            public BatchReader(ISimdStorage storage, string path, int index)
-            {
-                _fs = storage.OpenRead(path);
-                _br = new BinaryReader(_fs);
-                BatchIndex = index;
-                Next();
-            }
-
-            public void Next()
-            {
-                if (_fs.Position >= _fs.Length)
-                {
-                    Finished = true;
-                    CurrentToken = null;
-                    CurrentData = null;
-                    return;
-                }
-                try
-                {
-                    CurrentToken = _br.ReadString();
-                    int len = _br.ReadInt32(); // number of ulongs
-                    CurrentData = _br.ReadBytes(len * 8);
-                }
-                catch (EndOfStreamException)
-                {
-                    Finished = true;
-                }
-            }
-
-            public void Dispose()
-            {
-                _br.Dispose();
-                _fs.Dispose();
-            }
         }
     }
 }
