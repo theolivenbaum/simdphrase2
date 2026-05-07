@@ -110,22 +110,30 @@ overall throughput.
 
 ## Deletion benchmarks
 
-The benchmark indexes a corpus and then deletes 1,000 random doc ids.
-For SimdPhrase2 this exercises the `LiveDocs` deletion path; Lucene
-calls `DeleteDocuments` against the `id` field. Times include the
-preceding full index build, which dominates for these corpus sizes.
+The benchmark deletes 1,000 random doc ids from a pre-built index. The
+index is constructed once during `[GlobalSetup]` and copied into a fresh
+working directory in `[IterationSetup]`; only the open + delete + commit
+path is timed.
 
-| Method            | N       | Mean       | Allocated   |
-|-------------------|---------|-----------:|------------:|
-| Lucene_Delete     | 10,000  |   437.4 ms |   61.57 MB  |
-| SimdPhrase_Delete | 10,000  |   322.9 ms |  111.94 MB  |
-| Lucene_Delete     | 100,000 | 2,295.6 ms |  444.56 MB  |
-| SimdPhrase_Delete | 100,000 | 2,237.7 ms | 1072.12 MB  |
+For SimdPhrase2 this exercises the `LiveDocs` deletion path. Lucene
+calls `DeleteDocuments` against the `id` field, which writes a
+deletions file and runs the configured merge policy.
 
-For SimdPhrase2, the actual delete operation is `O(deleted)` and runs in
-~tens of microseconds for 1k ids — the bulk of the measured time is the
-preceding index build. Physical reclamation of disk space happens during
-the next segment compaction.
+| Method            | N       | Mean        | StdDev     | Allocated  |
+|-------------------|---------|------------:|-----------:|-----------:|
+| Lucene_Delete     | 10,000  |  20,812.6 µs |   779.9 µs | 2307.33 KB |
+| SimdPhrase_Delete | 10,000  |     769.5 µs |    40.7 µs |   90.48 KB |
+| Lucene_Delete     | 100,000 |  51,624.5 µs | 2,698.3 µs | 2468.61 KB |
+| SimdPhrase_Delete | 100,000 |     777.6 µs |    35.3 µs |   90.53 KB |
+
+| N       | Lucene (µs) | SimdPhrase2 (µs) | Speedup       |
+|---------|------------:|-----------------:|--------------:|
+| 10,000  |     20,813  |              770 | **27× faster** |
+| 100,000 |     51,625  |              778 | **66× faster** |
+
+SimdPhrase2 stays essentially constant in N for soft delete: the cost is
+proportional to the number of deletions, not the index size. Physical
+reclamation of disk space happens during the next segment compaction.
 
 ## Running benchmarks
 
