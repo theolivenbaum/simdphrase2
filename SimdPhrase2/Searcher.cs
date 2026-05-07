@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Buffers.Binary;
 using SimdPhrase2.Db;
 using SimdPhrase2.Roaringish;
 using SimdPhrase2.Roaringish.Intersect;
@@ -11,52 +10,201 @@ using SimdPhrase2.Storage;
 
 namespace SimdPhrase2
 {
+    public class SearcherOptions
+    {
+        public bool ForceNaive { get; set; } = false;
+        public ITextTokenizer Tokenizer { get; set; }
+        public ISimdStorage Storage { get; set; }
+    }
+
     public class Searcher : IDisposable
     {
         private readonly string _indexName;
-        private TokenStore _tokenStore;
+        private readonly List<SegmentReader> _segments;
         private DocumentStore _docStore;
-        private Stream? _packedFile;
+        private FieldRegistry _fieldRegistry;
+        private LiveDocs _globalDeletes;
+        private SegmentManifest _manifest;
         private IIntersect _intersect;
         private Stats _stats;
-        private HashSet<string> _commonTokens;
         private ITextTokenizer _tokenizer;
         private ISimdStorage _storage;
 
-        // BM25 / Boolean support
-        private Stream? _docLengthsStream;
         private IndexStats _indexStats;
         private float _avgDocLength;
+        private Dictionary<string, float> _avgDocLengthByField;
 
-        public Searcher(string indexName, bool forceNaive = false, ITextTokenizer tokenizer = null, ISimdStorage storage = null)
+        public Searcher(string indexName, SearcherOptions options)
         {
+            options ??= new SearcherOptions();
             _indexName = indexName;
-            _tokenizer = tokenizer ?? new BasicTokenizer();
-            _storage = storage ?? new FileSystemStorage();
-            _tokenStore = new TokenStore(indexName, _storage);
-            _docStore = new DocumentStore(indexName, _storage);
-            string packedPath = _storage.Combine(indexName, "roaringish_packed.bin");
-            if (_storage.FileExists(packedPath))
-            {
-                _packedFile = _storage.OpenRead(packedPath);
-            }
-            _intersect = forceNaive ? new NaiveIntersect() :  new SimdIntersect();
+            _tokenizer = options.Tokenizer ?? new BasicTokenizer();
+            _storage = options.Storage ?? new FileSystemStorage();
+            _intersect = options.ForceNaive ? new NaiveIntersect() : new SimdIntersect();
             _stats = new Stats();
-            _commonTokens = CommonTokensPersistence.Load(_storage, _storage.Combine(indexName, "common_tokens.bin"));
+            _segments = new List<SegmentReader>();
 
-            string docLengthsPath = _storage.Combine(indexName, "doc_lengths.bin");
-            if (_storage.FileExists(docLengthsPath))
-                _docLengthsStream = _storage.OpenRead(docLengthsPath);
+            _fieldRegistry = FieldRegistry.Load(_storage, _storage.Combine(indexName, "field_meta.json"));
+            _manifest = SegmentManifest.Load(_storage, _storage.Combine(indexName, "segments.json"));
+            _docStore = new DocumentStore(indexName, _storage);
+            _globalDeletes = LiveDocs.Load(_storage, _storage.Combine(indexName, "deleted_docs.bin"));
 
-            string statsPath = _storage.Combine(indexName, "index_stats.json");
-            _indexStats = IndexStats.Load(_storage, statsPath);
+            foreach (var s in _manifest.Segments)
+            {
+                string dir = _storage.Combine(_storage.Combine(indexName, "segments"), s.Id);
+                if (_storage.DirectoryExists(dir))
+                {
+                    _segments.Add(new SegmentReader(dir, _storage));
+                }
+            }
+
+            _indexStats = IndexStats.Load(_storage, _storage.Combine(indexName, "index_stats.json"));
             if (_indexStats.TotalDocs > 0)
                 _avgDocLength = (float)_indexStats.TotalTokens / _indexStats.TotalDocs;
+
+            // Per-field avg doc length.
+            _avgDocLengthByField = new Dictionary<string, float>();
+            var totalTokensByField = new Dictionary<string, ulong>();
+            var totalDocsByField = new Dictionary<string, uint>();
+            foreach (var s in _manifest.Segments)
+            {
+                foreach (var (f, t) in s.TokensByField)
+                {
+                    totalTokensByField.TryGetValue(f, out var sum);
+                    totalTokensByField[f] = sum + t;
+                }
+                foreach (var (f, d) in s.DocsByField)
+                {
+                    totalDocsByField.TryGetValue(f, out var sum);
+                    totalDocsByField[f] = sum + d;
+                }
+            }
+            foreach (var (f, t) in totalTokensByField)
+            {
+                if (totalDocsByField.TryGetValue(f, out var d) && d > 0)
+                    _avgDocLengthByField[f] = (float)t / d;
+            }
         }
 
-        private List<string> MergeAndMinimizeTokens(List<string> tokens)
+        public Searcher(string indexName, bool forceNaive = false, ITextTokenizer tokenizer = null, ISimdStorage storage = null)
+            : this(indexName, new SearcherOptions { ForceNaive = forceNaive, Tokenizer = tokenizer, Storage = storage })
+        { }
+
+        public FieldRegistry Fields => _fieldRegistry;
+
+        public void Dispose()
         {
-            if (_commonTokens.Count == 0) return tokens;
+            foreach (var s in _segments) s.Dispose();
+            _docStore?.Dispose();
+        }
+
+        public string GetDocument(uint docId) => _docStore.GetDocument(docId);
+
+        // ---- Search APIs ----
+
+        public List<uint> Search(string query) => Search(query, FieldRegistry.DefaultField);
+
+        public List<uint> Search(string query, string field)
+        {
+            var rawTokens = TokenizeRaw(query);
+            if (rawTokens.Count == 0) return new List<uint>();
+
+            var seen = new HashSet<uint>();
+            var result = new List<uint>();
+            foreach (var seg in _segments)
+            {
+                var docIds = SearchInSegment(seg, rawTokens, field);
+                foreach (var d in docIds)
+                {
+                    if (!_globalDeletes.IsLive(d)) continue;
+                    if (seen.Add(d)) result.Add(d);
+                }
+            }
+            return result;
+        }
+
+        private List<string> TokenizeRaw(string query)
+        {
+            var rawTokens = new List<string>();
+            foreach (var t in _tokenizer.Tokenize(query.AsSpan()))
+            {
+                rawTokens.Add(t.ToString());
+            }
+            return rawTokens;
+        }
+
+        private List<uint> SearchInSegment(SegmentReader seg, List<string> rawTokens, string field)
+        {
+            // Apply common-tokens optimization within segment to merge tokens.
+            var tokens = MergeAndMinimizeTokens(seg, rawTokens, field);
+
+            var packedTokens = new List<(string Token, RoaringishPacked Packed)>();
+            try
+            {
+                foreach (var token in tokens)
+                {
+                    string encoded = FieldRegistry.EncodeToken(field, token);
+                    if (!seg.Tokens.TryGet(encoded, out var offset)) return new List<uint>();
+                    packedTokens.Add((token, LoadPacked(seg, offset)));
+                }
+
+                if (packedTokens.Count == 1)
+                {
+                    return packedTokens[0].Packed.GetDocIds();
+                }
+
+                int bestIdx = 0;
+                long minLen = long.MaxValue;
+                for (int i = 0; i < packedTokens.Count - 1; i++)
+                {
+                    long len = packedTokens[i].Packed.Length + packedTokens[i + 1].Packed.Length;
+                    if (len < minLen) { minLen = len; bestIdx = i; }
+                }
+
+                var lhsItem = packedTokens[bestIdx];
+                var rhsItem = packedTokens[bestIdx + 1];
+                var result = Intersect(lhsItem.Packed, rhsItem.Packed, 1);
+
+                int leftI = bestIdx - 1;
+                int rightI = bestIdx + 2;
+                int resultPhraseLen = 2;
+
+                while (true)
+                {
+                    RoaringishPacked nextLhs = leftI >= 0 ? packedTokens[leftI].Packed : null;
+                    RoaringishPacked nextRhs = rightI < packedTokens.Count ? packedTokens[rightI].Packed : null;
+                    if (nextLhs == null && nextRhs == null) break;
+
+                    RoaringishPacked oldResult = result;
+                    if (nextLhs != null && (nextRhs == null || nextLhs.Length <= nextRhs.Length))
+                    {
+                        result = Intersect(nextLhs, result, (ushort)resultPhraseLen);
+                        resultPhraseLen++;
+                        leftI--;
+                    }
+                    else
+                    {
+                        result = Intersect(result, nextRhs, 1);
+                        resultPhraseLen++;
+                        rightI++;
+                    }
+                    oldResult.Dispose();
+                    if (result.Length == 0) break;
+                }
+
+                var docIds = result.GetDocIds();
+                result.Dispose();
+                return docIds;
+            }
+            finally
+            {
+                foreach (var pt in packedTokens) pt.Packed.Dispose();
+            }
+        }
+
+        private List<string> MergeAndMinimizeTokens(SegmentReader seg, List<string> tokens, string field)
+        {
+            if (seg.CommonTokens.Count == 0) return tokens;
 
             int n = tokens.Count;
             long[] dp = new long[n + 1];
@@ -68,47 +216,40 @@ namespace SimdPhrase2
 
             for (int i = n - 1; i >= 0; i--)
             {
-                // Try single token
                 string t = tokens[i];
-                if (_tokenStore.TryGet(t, out var offset))
+                string encoded = FieldRegistry.EncodeToken(field, t);
+                if (seg.Tokens.TryGet(encoded, out var offset))
                 {
                     long cost = (offset.Length / 8);
                     if (dp[i + 1] != long.MaxValue)
                     {
-                         cost += dp[i + 1];
-                         if (cost < dp[i])
-                         {
-                             dp[i] = cost;
-                             choice[i] = t;
-                             nextIndex[i] = i + 1;
-                         }
+                        cost += dp[i + 1];
+                        if (cost < dp[i])
+                        {
+                            dp[i] = cost;
+                            choice[i] = t;
+                            nextIndex[i] = i + 1;
+                        }
                     }
                 }
                 else
                 {
-                     // Token not found.
-                     // This means searching will fail anyway.
-                     // We prefer to fail fast with this token.
-                     dp[i] = 0;
-                     choice[i] = t;
-                     nextIndex[i] = i + 1;
+                    dp[i] = 0;
+                    choice[i] = t;
+                    nextIndex[i] = i + 1;
                 }
 
-                // Try merging
-                bool isFirstRare = !_commonTokens.Contains(t);
+                bool isFirstRare = !seg.CommonTokens.Contains(t);
                 string currentMerged = t;
-
                 int maxWindow = 3;
                 for (int j = 1; j < maxWindow && (i + j) < n; j++)
                 {
-                    string nextToken = tokens[i+j];
-                    bool isNextRare = !_commonTokens.Contains(nextToken);
-
+                    string nextToken = tokens[i + j];
+                    bool isNextRare = !seg.CommonTokens.Contains(nextToken);
                     if (isFirstRare && isNextRare) break;
-
                     currentMerged += " " + nextToken;
-
-                    if (_tokenStore.TryGet(currentMerged, out offset))
+                    string encodedMerged = FieldRegistry.EncodeToken(field, currentMerged);
+                    if (seg.Tokens.TryGet(encodedMerged, out offset))
                     {
                         if (dp[i + j + 1] != long.MaxValue)
                         {
@@ -121,7 +262,6 @@ namespace SimdPhrase2
                             }
                         }
                     }
-
                     if (isNextRare) break;
                 }
             }
@@ -130,144 +270,40 @@ namespace SimdPhrase2
             int curr = 0;
             while (curr < n)
             {
-                if (choice[curr] == null) return tokens; // Should not happen
+                if (choice[curr] == null) return tokens;
                 result.Add(choice[curr]);
                 curr = nextIndex[curr];
             }
             return result;
         }
 
-        private RoaringishPacked LoadPacked(FileOffset offset)
+        private RoaringishPacked LoadPacked(SegmentReader seg, FileOffset offset)
         {
-             int ulongCount = (int)(offset.Length / 8);
-             var buffer = new AlignedBuffer<ulong>(ulongCount);
-             buffer.SetLength(ulongCount);
+            int ulongCount = (int)(offset.Length / 8);
+            var buffer = new AlignedBuffer<ulong>(ulongCount);
+            buffer.SetLength(ulongCount);
 
-             _packedFile.Seek(offset.Begin, SeekOrigin.Begin);
-
-             Span<byte> byteSpan = MemoryMarshal.Cast<ulong, byte>(buffer.AsSpan());
-             _packedFile.ReadExactly(byteSpan);
-
-             return new RoaringishPacked(buffer, takeOwnership: true);
+            seg.PackedStream.Seek(offset.Begin, SeekOrigin.Begin);
+            Span<byte> byteSpan = MemoryMarshal.Cast<ulong, byte>(buffer.AsSpan());
+            seg.PackedStream.ReadExactly(byteSpan);
+            return new RoaringishPacked(buffer, takeOwnership: true);
         }
 
-        public List<uint> Search(string query)
-        {
-            if (_packedFile == null) return new List<uint>();
-
-            var rawTokens = new List<string>();
-            foreach(var t in _tokenizer.Tokenize(query.AsSpan()))
-            {
-                rawTokens.Add(t.ToString());
-            }
-
-            if (rawTokens.Count == 0) return new List<uint>();
-
-            var tokens = MergeAndMinimizeTokens(rawTokens);
-
-            var packedTokens = new List<(string Token, RoaringishPacked Packed)>();
-
-            try
-            {
-                foreach (var token in tokens)
-                {
-                    if (!_tokenStore.TryGet(token, out var offset))
-                    {
-                        // Console.WriteLine($"Token not found: {token}");
-                        return new List<uint>();
-                    }
-
-                    packedTokens.Add((token, LoadPacked(offset)));
-                }
-
-                if (packedTokens.Count == 1)
-                {
-                     return packedTokens[0].Packed.GetDocIds();
-                }
-
-                int bestIdx = 0;
-                long minLen = long.MaxValue;
-
-                for (int i = 0; i < packedTokens.Count - 1; i++)
-                {
-                    long len = packedTokens[i].Packed.Length + packedTokens[i+1].Packed.Length;
-                    if (len < minLen)
-                    {
-                        minLen = len;
-                        bestIdx = i;
-                    }
-                }
-
-                var lhsItem = packedTokens[bestIdx];
-                var rhsItem = packedTokens[bestIdx + 1];
-
-                var result = Intersect(lhsItem.Packed, rhsItem.Packed, 1);
-
-                int leftI = bestIdx - 1;
-                int rightI = bestIdx + 2;
-
-                int resultPhraseLen = 2;
-
-                while (true)
-                {
-                    RoaringishPacked nextLhs = leftI >= 0 ? packedTokens[leftI].Packed : null;
-                    RoaringishPacked nextRhs = rightI < packedTokens.Count ? packedTokens[rightI].Packed : null;
-
-                    if (nextLhs == null && nextRhs == null) break;
-
-                    RoaringishPacked oldResult = result;
-
-                    if (nextLhs != null && (nextRhs == null || nextLhs.Length <= nextRhs.Length))
-                    {
-                        result = Intersect(nextLhs, result, (ushort)resultPhraseLen);
-                        resultPhraseLen++;
-                        leftI--;
-                    }
-                    else
-                    {
-                         result = Intersect(result, nextRhs, 1);
-                         resultPhraseLen++;
-                         rightI++;
-                    }
-
-                    oldResult.Dispose(); // Free intermediate result
-
-                    if (result.Length == 0) break;
-                }
-
-                var docIds = result.GetDocIds();
-                result.Dispose();
-                return docIds;
-            }
-            finally
-            {
-                foreach(var pt in packedTokens) pt.Packed.Dispose();
-            }
-        }
-
-        public RoaringishPacked Intersect(RoaringishPacked lhs, RoaringishPacked rhs, ushort lhsLenFull)
+        private RoaringishPacked Intersect(RoaringishPacked lhs, RoaringishPacked rhs, ushort lhsLenFull)
         {
             ulong addToGroup = (ulong)(lhsLenFull / 16) * RoaringishPacked.ADD_ONE_GROUP;
             ushort lhsLen = (ushort)(lhsLenFull % 16);
-
             ushort msbMask = (ushort)(~((ushort)ushort.MaxValue >> lhsLen));
             ushort lsbMask = (ushort)(~((ushort)ushort.MaxValue << lhsLen));
 
             int size = _intersect.IntersectionBufferSize(lhs.Length, rhs.Length);
-
             using var packedResult = new AlignedBuffer<ulong>(size);
             packedResult.SetLength(size);
-            using var msbPackedResult = new AlignedBuffer<ulong>(lhs.Length + 1); // Rust uses lhs.len() + 1
+            using var msbPackedResult = new AlignedBuffer<ulong>(lhs.Length + 1);
             msbPackedResult.SetLength(lhs.Length + 1);
 
             int lhsI = 0, rhsI = 0, i = 0, j = 0;
-
-            // First Pass
-            int packedLen1 = 0;
-            int msbLen1 = 0;
-
-            // Check proportion for Gallop First Pass
-            // Avoid division by zero
+            int packedLen1 = 0, msbLen1 = 0;
             int minLen = Math.Min(lhs.Length, rhs.Length);
             int maxLen = Math.Max(lhs.Length, rhs.Length);
             int proportion = minLen > 0 ? maxLen / minLen : 0;
@@ -276,9 +312,6 @@ namespace SimdPhrase2
             {
                 GallopIntersectFirst.Intersect(true, lhs.AsSpan(), rhs.AsSpan(), packedResult, ref i, addToGroup, lhsLen, lsbMask, _stats);
                 packedLen1 = i;
-
-                // We need to run it again for msb part (first=false logic equivalent for GallopFirst)
-                // Note: GallopIntersectFirst handles first=false logic too
                 GallopIntersectFirst.Intersect(false, lhs.AsSpan(), rhs.AsSpan(), msbPackedResult, ref j, addToGroup, lhsLen, lsbMask, _stats);
                 msbLen1 = j;
             }
@@ -291,19 +324,17 @@ namespace SimdPhrase2
 
             if (msbLen1 == 0)
             {
-                 var ret = new RoaringishPacked(packedLen1);
-                 ret.Buffer.SetLength(packedLen1);
-                 packedResult.AsSpan(0, packedLen1).CopyTo(ret.Buffer.AsSpan());
-                 return ret;
+                var ret = new RoaringishPacked(packedLen1);
+                ret.Buffer.SetLength(packedLen1);
+                packedResult.AsSpan(0, packedLen1).CopyTo(ret.Buffer.AsSpan());
+                return ret;
             }
 
-            // Second Pass
             using var msbResult2 = new AlignedBuffer<ulong>(size);
             msbResult2.SetLength(size);
             using var dummy = new AlignedBuffer<ulong>(0);
 
             int msbLen2 = 0;
-
             minLen = Math.Min(msbLen1, rhs.Length);
             maxLen = Math.Max(msbLen1, rhs.Length);
             proportion = minLen > 0 ? maxLen / minLen : 0;
@@ -321,116 +352,113 @@ namespace SimdPhrase2
                 msbLen2 = i2;
             }
 
-            // Merge
             return RoaringishPacked.MergeResults(packedResult, packedLen1, msbResult2, msbLen2);
         }
 
-        public void Dispose()
-        {
-            _tokenStore.Dispose();
-            _docStore.Dispose();
-            _packedFile?.Dispose();
-            _docLengthsStream?.Dispose();
-        }
-
-        public string GetDocument(uint docId) => _docStore.GetDocument(docId);
-
-        // --- BM25 Implementation ---
-
-        private int GetDocLength(uint docId)
-        {
-            if (_docLengthsStream == null) return 0;
-            // docLengths is int32 array.
-            long pos = (long)docId * 4;
-            if (pos >= _docLengthsStream.Length) return 0;
-
-            _docLengthsStream.Seek(pos, SeekOrigin.Begin);
-            Span<byte> buffer = stackalloc byte[4];
-            int read = _docLengthsStream.Read(buffer);
-            if (read < 4) return 0;
-            return BinaryPrimitives.ReadInt32LittleEndian(buffer);
-        }
+        // ---- BM25 ----
 
         public List<(uint DocId, float Score)> SearchBM25(string query, int k = 10, float k1 = 1.2f, float b = 0.75f)
-        {
-            if (_packedFile == null) return new List<(uint, float)>();
+            => SearchBM25(query, FieldRegistry.DefaultField, k, k1, b);
 
-            var tokens = new List<string>();
-            foreach(var t in _tokenizer.Tokenize(query.AsSpan()))
-            {
-                tokens.Add(t.ToString());
-            }
+        public List<(uint DocId, float Score)> SearchBM25(string query, string field, int k = 10, float k1 = 1.2f, float b = 0.75f)
+        {
+            var tokens = TokenizeRaw(query);
             if (tokens.Count == 0) return new List<(uint, float)>();
 
-            var scores = new Dictionary<uint, float>();
-            long N = _stats != null ? _indexStats.TotalDocs : 0; // Using _indexStats
-            float avgDocLength = (float)_avgDocLength;
-            foreach(var t in tokens)
+            float boost = _fieldRegistry.GetBoost(field);
+            float avgLen = _avgDocLengthByField.TryGetValue(field, out var v) && v > 0 ? v
+                          : (_avgDocLength > 0 ? _avgDocLength : 1f);
+
+            // Aggregate doc-frequency (DF) across segments per token.
+            long N = 0;
+            foreach (var s in _manifest.Segments) N += s.DocsByField.TryGetValue(field, out var d) ? d : 0;
+            if (N == 0) N = _indexStats.TotalDocs;
+
+            var df = new Dictionary<string, int>();
+            foreach (var t in tokens)
             {
-                if (_tokenStore.TryGet(t, out var offset))
+                string encoded = FieldRegistry.EncodeToken(field, t);
+                int total = 0;
+                foreach (var seg in _segments)
                 {
-                     float idf = MathF.Log(1f + (N - offset.DocCount + 0.5f) / (offset.DocCount + 0.5f));
-                     if (idf < 0) idf = 0;
+                    if (seg.Tokens.TryGet(encoded, out var off)) total += off.DocCount;
+                }
+                df[t] = total;
+            }
 
-                     using var packed = LoadPacked(offset);
-                     var freqs = packed.GetDocIdsAndFreqs();
-                     foreach(var (docId, tf) in freqs)
-                     {
-                         int docLen = GetDocLength(docId);
-                         float score = idf * (tf * (k1 + 1f)) / (tf + k1 * (1f - b + b * (docLen / avgDocLength)));
+            var scores = new Dictionary<uint, float>();
+            foreach (var t in tokens)
+            {
+                int dfi = df[t];
+                if (dfi == 0) continue;
+                float idf = MathF.Log(1f + (N - dfi + 0.5f) / (dfi + 0.5f));
+                if (idf < 0) idf = 0;
 
-                         ref float scoreVal = ref CollectionsMarshal.GetValueRefOrAddDefault(scores, docId, out _);
-                         scoreVal += score;
-                     }
+                string encoded = FieldRegistry.EncodeToken(field, t);
+                foreach (var seg in _segments)
+                {
+                    if (!seg.Tokens.TryGet(encoded, out var off)) continue;
+                    using var packed = LoadPacked(seg, off);
+                    var freqs = packed.GetDocIdsAndFreqs();
+                    foreach (var (docId, tf) in freqs)
+                    {
+                        if (!_globalDeletes.IsLive(docId)) continue;
+                        int docLen = seg.DocLengths.Get(docId, field);
+                        if (docLen == 0) docLen = (int)avgLen;
+                        float score = boost * idf * (tf * (k1 + 1f)) / (tf + k1 * (1f - b + b * (docLen / avgLen)));
+                        ref float scoreVal = ref CollectionsMarshal.GetValueRefOrAddDefault(scores, docId, out _);
+                        scoreVal += score;
+                    }
                 }
             }
 
             return scores.OrderByDescending(kvp => kvp.Value).Take(k).Select(kvp => (kvp.Key, kvp.Value)).ToList();
         }
 
-        // --- Boolean Implementation ---
+        // ---- Boolean ----
 
         public List<uint> SearchBoolean(string query)
         {
-             var parser = new BooleanQueryParser();
-             var root = parser.Parse(query);
-             if (root == null) return new List<uint>();
-             return SearchBoolean(root);
+            var parser = new BooleanQueryParser();
+            var root = parser.Parse(query);
+            if (root == null) return new List<uint>();
+            return SearchBoolean(root);
         }
 
         public List<uint> SearchBoolean(QueryNode root)
         {
-             if (root == null) return new List<uint>();
-
-             // Evaluate and sort
-             var results = Evaluate(root);
-             return results.OrderBy(x => x).ToList();
+            if (root == null) return new List<uint>();
+            var results = Evaluate(root);
+            return results.OrderBy(x => x).ToList();
         }
 
         private IEnumerable<uint> Evaluate(QueryNode node)
         {
             if (node is TermNode t)
             {
-                 // Use Search() to handle phrase search if term is multiple words?
-                 // Parser produces single words.
-                 // But if we want to support phrases in future, Search() is good.
-                 // Also, Search() handles normalization/tokenization of the term properly.
-                 return Search(t.Term);
+                // Field-prefixed terms: "field:term"
+                string term = t.Term;
+                string field = FieldRegistry.DefaultField;
+                int colon = term.IndexOf(':');
+                if (colon > 0)
+                {
+                    string maybeField = term.Substring(0, colon);
+                    if (_fieldRegistry.Contains(maybeField))
+                    {
+                        field = maybeField;
+                        term = term.Substring(colon + 1);
+                    }
+                }
+                return Search(term, field);
             }
-            if (node is AndNode a)
-            {
-                return Evaluate(a.Left).Intersect(Evaluate(a.Right));
-            }
-            if (node is OrNode o)
-            {
-                return Evaluate(o.Left).Union(Evaluate(o.Right));
-            }
+            if (node is AndNode a) return Evaluate(a.Left).Intersect(Evaluate(a.Right));
+            if (node is OrNode o) return Evaluate(o.Left).Union(Evaluate(o.Right));
             if (node is NotNode n)
             {
-                 // Calculate AllDocs - Child
-                 // We need to materialize child to HashSet for efficient check
-                 var childDocs = new HashSet<uint>(Evaluate(n.Child));
-                 return Enumerable.Range(0, (int)_indexStats.TotalDocs).Select(i => (uint)i).Where(id => !childDocs.Contains(id));
+                var childDocs = new HashSet<uint>(Evaluate(n.Child));
+                return Enumerable.Range(0, (int)_indexStats.TotalDocs)
+                    .Select(i => (uint)i)
+                    .Where(id => !childDocs.Contains(id) && _globalDeletes.IsLive(id));
             }
             return Enumerable.Empty<uint>();
         }

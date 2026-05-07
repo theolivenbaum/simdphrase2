@@ -37,35 +37,38 @@ namespace SimdPhrase2.Tests
                 indexer.Index(docs);
             }
 
-            // Verify IndexStats
+            // IndexStats lives at the index root and aggregates across segments.
             var statsPath = Path.Combine(_indexName, "index_stats.json");
             Assert.True(File.Exists(statsPath));
             var stats = IndexStats.Load(new FileSystemStorage(), statsPath);
             Assert.Equal(3u, stats.TotalDocs);
             Assert.Equal(7ul, stats.TotalTokens);
 
-            // Verify DocLengths
-            var docLengthsPath = Path.Combine(_indexName, "doc_lengths.bin");
-            Assert.True(File.Exists(docLengthsPath));
-            using (var fs = File.OpenRead(docLengthsPath))
-            using (var br = new BinaryReader(fs))
-            {
-                Assert.Equal(12, fs.Length); // 3 docs * 4 bytes
-                Assert.Equal(2, br.ReadInt32());
-                Assert.Equal(2, br.ReadInt32());
-                Assert.Equal(3, br.ReadInt32());
-            }
+            // The new on-disk layout puts segment files under segments/seg_<id>/.
+            var segmentsRoot = Path.Combine(_indexName, "segments");
+            Assert.True(Directory.Exists(segmentsRoot));
+            var segDirs = Directory.GetDirectories(segmentsRoot);
+            Assert.Single(segDirs);
+            var segDir = segDirs[0];
 
-            // Verify TokenStore counts
-            using (var tokenStore = new TokenStore(_indexName))
+            // Per-segment doc lengths file exists.
+            Assert.True(File.Exists(Path.Combine(segDir, "doc_lengths.bin")));
+
+            var lengths = DocLengthsStore.Load(new FileSystemStorage(), Path.Combine(segDir, "doc_lengths.bin"));
+            Assert.Equal(2, lengths.Get(0u, FieldRegistry.DefaultField));
+            Assert.Equal(2, lengths.Get(1u, FieldRegistry.DefaultField));
+            Assert.Equal(3, lengths.Get(2u, FieldRegistry.DefaultField));
+
+            // TokenStore stores field-prefixed tokens.
+            using (var tokenStore = new TokenStore(segDir))
             {
-                Assert.True(tokenStore.TryGet("hello", out var offset));
+                Assert.True(tokenStore.TryGet(FieldRegistry.EncodeToken(FieldRegistry.DefaultField, "hello"), out var offset));
                 Assert.Equal(3, offset.DocCount);
 
-                Assert.True(tokenStore.TryGet("world", out offset));
+                Assert.True(tokenStore.TryGet(FieldRegistry.EncodeToken(FieldRegistry.DefaultField, "world"), out offset));
                 Assert.Equal(2, offset.DocCount);
 
-                Assert.True(tokenStore.TryGet("universe", out offset));
+                Assert.True(tokenStore.TryGet(FieldRegistry.EncodeToken(FieldRegistry.DefaultField, "universe"), out offset));
                 Assert.Equal(1, offset.DocCount);
             }
         }

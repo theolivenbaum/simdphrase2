@@ -6,18 +6,49 @@ It implements a fast phrase search algorithm using SIMD (AVX-512) where availabl
 ## Project Structure
 
 *   `SimdPhrase2/`: The main Class Library.
-    *   `Utils.cs`: Tokenization and normalization.
+    *   `BasicTokenizer.cs`, `NGramTokenizer.cs`, `BreakingNGramTokenizer.cs`: Tokenizer implementations.
     *   `Roaringish/`: Core data structures and intersection logic.
         *   `RoaringishPacked.cs`: Packed representation of document IDs and positions.
         *   `AlignedBuffer.cs`: Memory management for SIMD.
-        *   `Intersect/`: Intersection algorithms (Naive, Simd).
-    *   `Db/`: Database and storage logic.
-        *   `DocumentStore.cs`: Storage for document content.
-        *   `TokenStore.cs`: Storage for token -> offset mapping.
-    *   `Indexer.cs`: Indexing logic.
-    *   `Searcher.cs`: Search logic.
+        *   `Intersect/`: Intersection algorithms (Naive, Simd, Gallop).
+    *   `Db/`: Persistent stores.
+        *   `DocumentStore.cs`: Cross-segment document blob store.
+        *   `TokenStore.cs`: Per-segment token -> offset mapping.
+        *   `DocLengthsStore.cs`: Per-segment, per-field document lengths.
+        *   `LiveDocs.cs`: Sparse deleted-doc set.
+        *   `SegmentManifest.cs`: Index-level list of active segments.
+        *   `SegmentReader.cs`: Read-only handle to one segment on disk.
+        *   `FieldRegistry.cs`: Registered fields and their boosts.
+    *   `Document.cs`: `IndexDocument` and `FieldOptions`.
+    *   `Indexer.cs`: Multi-field, segmented indexing with auto-compaction.
+    *   `Searcher.cs`: Cross-segment query execution.
 *   `SimdPhrase2.Tests/`: Unit and integration tests.
+*   `SimdPhrase2.Benchmarks/`: BenchmarkDotNet vs Lucene.Net.
 *   `reference/`: The original Rust codebase for reference.
+
+## Storage layout
+
+```
+<indexName>/
+    field_meta.json           # registered fields + boosts
+    segments.json             # list of active segments
+    deleted_docs.bin          # global soft-delete set
+    index_stats.json          # aggregated TotalDocs/TotalTokens
+    doc_offsets.bin           # cross-segment DocumentStore index
+    documents.bin             # cross-segment DocumentStore data
+    segments/
+        seg_000000/
+            roaringish_packed.bin
+            token_map.bin     # tokens are encoded "field<US>token"
+            doc_lengths.bin
+            common_tokens.bin (optional)
+            live_docs.bin
+        seg_000001/...
+```
+
+New batches are written to fresh segment directories on `Indexer.Commit()`.
+When the segment count exceeds `IndexerOptions.MaxSegmentsBeforeCompact`, all
+segments are merged into one and physically deleted documents are dropped.
 
 ## Key Concepts
 
