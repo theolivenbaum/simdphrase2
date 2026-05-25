@@ -1,15 +1,26 @@
 using System;
+using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Generic;
-using System.IO;
+using System.Text;
+using RocksDbSharp;
 using SimdPhrase2.Storage;
 
 namespace SimdPhrase2.Db
 {
+    // Metadata about a single posting list for a (field, token). The actual posting
+    // data lives in the `postings` column family, keyed by (segId, field, token).
     public struct FileOffset
     {
-        public long Begin;
-        public long Length;
+        // Number of ulong entries in the posting list (i.e. value byte length / 8).
+        public int UlongCount;
+        // Number of unique doc ids represented by this posting list. Used by BM25.
         public int DocCount;
+
+        // Backwards-compatible accessors kept for the few callers that still talk
+        // in byte terms.
+        public long Begin => 0;
+        public long Length => (long)UlongCount * 8;
     }
 
     // Composite key identifying a posting list inside a segment: the field index
@@ -42,104 +53,113 @@ namespace SimdPhrase2.Db
         public override string ToString() => $"[{Field}]{Token}";
     }
 
-    public class TokenStore : IDisposable
+    // In-memory token map for a single segment. Persisted as one blob in the
+    // seg_tokens column family - segId(8 BE) -> packed list of (field, token,
+    // ulongCount, docCount). Loaded once at segment open and kept resident; the
+    // actual posting data is loaded on demand from the `postings` CF.
+    public sealed class TokenStore
     {
-        private const int Version = 2;
+        private const int Version = 1;
 
-        private readonly string _path;
-        private Dictionary<FieldToken, FileOffset> _map;
-        private bool _dirty;
-        private readonly ISimdStorage _storage;
+        private readonly Dictionary<FieldToken, FileOffset> _map;
 
-        public TokenStore(string basePath, ISimdStorage storage = null)
+        public TokenStore()
         {
-            _storage = storage ?? new FileSystemStorage();
-            _path = _storage.Combine(basePath, "token_map.bin");
             _map = new Dictionary<FieldToken, FileOffset>();
-            Load();
         }
 
-        private void Load()
+        public int Count => _map.Count;
+
+        public void Add(byte field, string token, int ulongCount, int docCount)
         {
-            if (!_storage.FileExists(_path)) return;
-            using var fs = _storage.OpenRead(_path);
-            using var reader = new BinaryReader(fs);
-
-            try
-            {
-                int version = reader.ReadInt32();
-                if (version != Version)
-                {
-                    // Incompatible on-disk format - the caller is expected to rebuild the index.
-                    throw new InvalidDataException($"TokenStore version mismatch: file is {version}, code expects {Version}.");
-                }
-                int count = reader.ReadInt32();
-                for (int i = 0; i < count; i++)
-                {
-                    byte field = reader.ReadByte();
-                    string token = reader.ReadString();
-                    long begin = reader.ReadInt64();
-                    long len = reader.ReadInt64();
-                    int docCount = reader.ReadInt32();
-                    _map[new FieldToken(field, token)] = new FileOffset { Begin = begin, Length = len, DocCount = docCount };
-                }
-            }
-            catch (EndOfStreamException)
-            {
-                // partial write - tolerate
-            }
+            _map[new FieldToken(field, token)] = new FileOffset { UlongCount = ulongCount, DocCount = docCount };
         }
-
-        public void Save()
-        {
-            if (!_dirty) return;
-            using var fs = _storage.OpenWrite(_path);
-            using var writer = new BinaryWriter(fs);
-
-            writer.Write(Version);
-            writer.Write(_map.Count);
-            foreach (var kvp in _map)
-            {
-                writer.Write(kvp.Key.Field);
-                writer.Write(kvp.Key.Token);
-                writer.Write(kvp.Value.Begin);
-                writer.Write(kvp.Value.Length);
-                writer.Write(kvp.Value.DocCount);
-            }
-            _dirty = false;
-        }
-
-        public void Add(byte field, string token, long begin, long length, int docCount)
-        {
-            _map[new FieldToken(field, token)] = new FileOffset { Begin = begin, Length = length, DocCount = docCount };
-            _dirty = true;
-        }
-
-        // Backward-compatible: defaults to field 0.
-        public void Add(string token, long begin, long length, int docCount)
-            => Add(0, token, begin, length, docCount);
 
         public bool TryGet(byte field, string token, out FileOffset offset)
-        {
-            return _map.TryGetValue(new FieldToken(field, token), out offset);
-        }
+            => _map.TryGetValue(new FieldToken(field, token), out offset);
 
         // Backward-compatible shorthand: looks up in field 0.
         public bool TryGet(string token, out FileOffset offset) => TryGet(0, token, out offset);
 
         public IEnumerable<FieldToken> GetAllEntries() => _map.Keys;
 
-        // Legacy enumeration of token strings (assumes field 0). Kept for tests
-        // that exercise the field-less surface.
+        // Legacy enumeration of token strings (assumes field 0).
         public IEnumerable<string> GetAllTokens()
         {
             foreach (var k in _map.Keys)
                 if (k.Field == 0) yield return k.Token;
         }
 
-        public void Dispose()
+        // Serialize the in-memory token map to a single byte blob suitable for
+        // storage as a value in the seg_tokens CF.
+        public byte[] Serialize()
         {
-            Save();
+            // Predict size: int32 version, int32 count, then per entry: byte field,
+            // int32 tokenByteLen, utf-8 bytes, int32 ulongCount, int32 docCount.
+            int size = 4 + 4;
+            foreach (var kvp in _map)
+            {
+                size += 1 + 4 + Encoding.UTF8.GetByteCount(kvp.Key.Token) + 4 + 4;
+            }
+            var buf = new byte[size];
+            var span = buf.AsSpan();
+            BinaryPrimitives.WriteInt32LittleEndian(span.Slice(0, 4), Version);
+            BinaryPrimitives.WriteInt32LittleEndian(span.Slice(4, 4), _map.Count);
+            int pos = 8;
+            foreach (var kvp in _map)
+            {
+                buf[pos++] = kvp.Key.Field;
+                int n = Encoding.UTF8.GetByteCount(kvp.Key.Token);
+                BinaryPrimitives.WriteInt32LittleEndian(span.Slice(pos, 4), n);
+                pos += 4;
+                Encoding.UTF8.GetBytes(kvp.Key.Token, 0, kvp.Key.Token.Length, buf, pos);
+                pos += n;
+                BinaryPrimitives.WriteInt32LittleEndian(span.Slice(pos, 4), kvp.Value.UlongCount);
+                pos += 4;
+                BinaryPrimitives.WriteInt32LittleEndian(span.Slice(pos, 4), kvp.Value.DocCount);
+                pos += 4;
+            }
+            return buf;
+        }
+
+        public static TokenStore Deserialize(ReadOnlySpan<byte> bytes)
+        {
+            var store = new TokenStore();
+            if (bytes.Length < 8) return store;
+            int version = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(0, 4));
+            if (version != Version) throw new InvalidOperationException($"TokenStore version mismatch: file is {version}, code expects {Version}.");
+            int count = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(4, 4));
+            int pos = 8;
+            for (int i = 0; i < count; i++)
+            {
+                if (pos + 1 + 4 > bytes.Length) break;
+                byte field = bytes[pos++];
+                int n = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(pos, 4));
+                pos += 4;
+                if (pos + n + 8 > bytes.Length) break;
+                string token = Encoding.UTF8.GetString(bytes.Slice(pos, n));
+                pos += n;
+                int ulongCount = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(pos, 4));
+                pos += 4;
+                int docCount = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(pos, 4));
+                pos += 4;
+                store._map[new FieldToken(field, token)] = new FileOffset { UlongCount = ulongCount, DocCount = docCount };
+            }
+            return store;
+        }
+
+        public static TokenStore Load(SimdPhraseDb db, ulong segId)
+        {
+            var key = Keys.SegIdKey(segId);
+            var bytes = db.Db.Get(key, db.SegTokens);
+            if (bytes == null) return new TokenStore();
+            return Deserialize(bytes);
+        }
+
+        public void AddToBatch(WriteBatch batch, ColumnFamilyHandle segTokensCf, ulong segId)
+        {
+            var key = Keys.SegIdKey(segId);
+            batch.Put(key, Serialize(), segTokensCf);
         }
     }
 }

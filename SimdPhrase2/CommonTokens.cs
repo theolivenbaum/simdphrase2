@@ -1,6 +1,8 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
-using System.IO;
+using System.Text;
+using RocksDbSharp;
 using SimdPhrase2.Storage;
 
 namespace SimdPhrase2
@@ -33,38 +35,62 @@ namespace SimdPhrase2
         }
     }
 
+    // The persisted common-token list is a single value in the meta column
+    // family: [int32 count] then for each token [int32 lenBytes][utf-8 bytes].
     public static class CommonTokensPersistence
     {
-        public static void Save(ISimdStorage storage, string path, HashSet<string> tokens)
+        public static byte[] Serialize(HashSet<string> tokens)
         {
-            using var fs = storage.OpenWrite(path);
-            using var writer = new BinaryWriter(fs);
-            writer.Write(tokens.Count);
-            foreach (var token in tokens)
+            int size = 4;
+            foreach (var t in tokens) size += 4 + Encoding.UTF8.GetByteCount(t);
+            var buf = new byte[size];
+            var span = buf.AsSpan();
+            BinaryPrimitives.WriteInt32LittleEndian(span.Slice(0, 4), tokens.Count);
+            int pos = 4;
+            foreach (var t in tokens)
             {
-                writer.Write(token);
+                int n = Encoding.UTF8.GetByteCount(t);
+                BinaryPrimitives.WriteInt32LittleEndian(span.Slice(pos, 4), n);
+                pos += 4;
+                Encoding.UTF8.GetBytes(t, 0, t.Length, buf, pos);
+                pos += n;
             }
+            return buf;
         }
 
-        public static HashSet<string> Load(ISimdStorage storage, string path)
+        public static HashSet<string> Deserialize(ReadOnlySpan<byte> bytes)
         {
-            var tokens = new HashSet<string>();
-            if (!storage.FileExists(path)) return tokens;
-
-            using var fs = storage.OpenRead(path);
-            using var reader = new BinaryReader(fs);
-
-            try
+            var set = new HashSet<string>();
+            if (bytes.Length < 4) return set;
+            int count = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(0, 4));
+            int pos = 4;
+            for (int i = 0; i < count; i++)
             {
-                int count = reader.ReadInt32();
-                for (int i = 0; i < count; i++)
-                {
-                    tokens.Add(reader.ReadString());
-                }
+                if (pos + 4 > bytes.Length) break;
+                int n = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(pos, 4));
+                pos += 4;
+                if (pos + n > bytes.Length) break;
+                set.Add(Encoding.UTF8.GetString(bytes.Slice(pos, n)));
+                pos += n;
             }
-            catch (EndOfStreamException) { }
+            return set;
+        }
 
-            return tokens;
+        public static HashSet<string> Load(SimdPhraseDb db)
+        {
+            var bytes = db.Db.Get(Encoding.UTF8.GetBytes(SimdPhraseDb.MetaKeyCommonTokens), db.Meta);
+            if (bytes == null) return new HashSet<string>();
+            return Deserialize(bytes);
+        }
+
+        public static void Save(SimdPhraseDb db, HashSet<string> tokens)
+        {
+            db.Db.Put(Encoding.UTF8.GetBytes(SimdPhraseDb.MetaKeyCommonTokens), Serialize(tokens), db.Meta);
+        }
+
+        public static void AddToBatch(WriteBatch batch, ColumnFamilyHandle metaCf, HashSet<string> tokens)
+        {
+            batch.Put(Encoding.UTF8.GetBytes(SimdPhraseDb.MetaKeyCommonTokens), Serialize(tokens), metaCf);
         }
     }
 }

@@ -1,40 +1,34 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
-using System.IO;
-using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
+using RocksDbSharp;
 using SimdPhrase2.Db;
 using SimdPhrase2.Roaringish;
 using SimdPhrase2.Storage;
 
 namespace SimdPhrase2.Segments
 {
-    // Builds an immutable segment on disk from one of:
-    //   1. An in-memory dictionary of (token -> RoaringishPacked) - typical commit path.
-    //   2. Multiple existing batch files written by the indexer.
-    //   3. Multiple existing segments (used by the merge policy).
+    // Builds an immutable segment in RocksDB from one of:
+    //   1. An in-memory dictionary of (FieldToken -> RoaringishPacked) - typical commit path.
+    //   2. Multiple existing segments (used by the merge policy).
     //
-    // Writes:
-    //   - <segmentDir>/roaringish_packed.bin
-    //   - <segmentDir>/token_map.bin
-    //   - <segmentDir>/deletes.bin (only if deletes are present)
+    // Writes - all via a single WriteBatch so a segment becomes visible atomically:
+    //   - postings CF:      one entry per (segId, field, token) -> raw posting bytes
+    //   - seg_tokens CF:    token map for the segment
+    //   - seg_meta CF:      SegmentInfo (doc count, size, etc.)
+    //   - seg_live_docs CF: bitmap of doc ids actually present in the segment
+    //   - meta CF:          next_segment_id counter (so the allocated id is persisted)
     public static class SegmentWriter
     {
-        // Write a segment from an in-memory token dictionary plus optional staged batch
-        // files. Each batch file uses the same format produced by the existing indexer's
-        // FlushBatch, so we reuse that format here. After writing, the batch files are
-        // deleted by the caller.
         public static SegmentInfo Write(
-            ISimdStorage storage,
-            string indexPath,
-            string segmentId,
+            SimdPhraseDb db,
+            ulong segmentId,
             Dictionary<FieldToken, RoaringishPacked> inMemoryBatch,
-            IReadOnlyList<string> stagedBatchFiles)
+            WriteBatch sharedBatch = null,
+            HashSet<uint> dropDocs = null)
         {
-            var dir = SegmentManifest.SegmentDirectory(storage, indexPath, segmentId);
-            storage.CreateDirectory(dir);
-
-            // We feed the merge from a sorted in-memory enumerator + each staged batch file.
             var readers = new List<ISegmentInputReader>();
             try
             {
@@ -42,15 +36,7 @@ namespace SimdPhrase2.Segments
                 {
                     readers.Add(new InMemoryReader(inMemoryBatch, readers.Count));
                 }
-                if (stagedBatchFiles != null)
-                {
-                    for (int i = 0; i < stagedBatchFiles.Count; i++)
-                    {
-                        readers.Add(new BatchFileReader(storage, stagedBatchFiles[i], readers.Count));
-                    }
-                }
-
-                return MergeReadersIntoSegment(storage, dir, readers);
+                return MergeReadersIntoSegment(db, segmentId, readers, sharedBatch, dropDocs);
             }
             finally
             {
@@ -58,28 +44,21 @@ namespace SimdPhrase2.Segments
             }
         }
 
-        // Produce a new segment by merging existing source segments. Source segments'
-        // packed posting lists already use global doc IDs and are already sorted, so
-        // we simply concatenate per token (preserving sorted token order via a priority
-        // queue). Deleted doc IDs are dropped via a streaming filter; the resulting
-        // segment has no deletes.
+        // Produce a new segment by merging existing source segments.
         public static SegmentInfo Merge(
-            ISimdStorage storage,
-            string indexPath,
-            string newSegmentId,
-            IReadOnlyList<SegmentReader> sources)
+            SimdPhraseDb db,
+            ulong newSegmentId,
+            IReadOnlyList<SegmentReader> sources,
+            WriteBatch sharedBatch = null)
         {
-            var dir = SegmentManifest.SegmentDirectory(storage, indexPath, newSegmentId);
-            storage.CreateDirectory(dir);
-
             var readers = new List<ISegmentInputReader>();
             try
             {
                 for (int i = 0; i < sources.Count; i++)
                 {
-                    readers.Add(new SegmentTokenReader(sources[i], i));
+                    readers.Add(new SegmentPostingsIteratorReader(db, sources[i], i));
                 }
-                var info = MergeReadersIntoSegment(storage, dir, readers);
+                var info = MergeReadersIntoSegment(db, newSegmentId, readers, sharedBatch, dropDocs: null);
                 info.MergedSegment = true;
                 info.Id = newSegmentId;
                 return info;
@@ -90,134 +69,142 @@ namespace SimdPhrase2.Segments
             }
         }
 
-        // Merge any number of token-stream readers into a single segment directory.
-        // All readers expose entries of ((field,token), packedBytes) sorted by
-        // (field, token). Returns SegmentInfo with Id unset, but DocCount set to the
-        // true number of unique doc ids written, and SizeInBytes set to the packed
-        // file size. Also writes a doc_ids.bin roaring bitmap of the doc ids
-        // actually present in this segment so that delete tracking is precise even
-        // after merges.
-        private static SegmentInfo MergeReadersIntoSegment(ISimdStorage storage, string dir, List<ISegmentInputReader> readers)
+        private static SegmentInfo MergeReadersIntoSegment(
+            SimdPhraseDb db,
+            ulong segmentId,
+            List<ISegmentInputReader> readers,
+            WriteBatch sharedBatch,
+            HashSet<uint> dropDocs)
         {
-            var pq = new PriorityQueue<ISegmentInputReader, (FieldToken, int)>(Comparer<(FieldToken, int)>.Create((a, b) =>
+            bool ownBatch = sharedBatch == null;
+            var batch = sharedBatch ?? new WriteBatch();
+            try
             {
-                int cmp = a.Item1.CompareTo(b.Item1);
-                return cmp != 0 ? cmp : a.Item2.CompareTo(b.Item2);
-            }));
+                var pq = new PriorityQueue<ISegmentInputReader, (FieldToken, int)>(Comparer<(FieldToken, int)>.Create((a, b) =>
+                {
+                    int cmp = a.Item1.CompareTo(b.Item1);
+                    return cmp != 0 ? cmp : a.Item2.CompareTo(b.Item2);
+                }));
 
-            foreach (var r in readers)
-            {
-                if (!r.Finished) pq.Enqueue(r, (r.CurrentKey, r.Order));
+                foreach (var r in readers)
+                {
+                    if (!r.Finished) pq.Enqueue(r, (r.CurrentKey, r.Order));
+                }
+
+                var tokenStore = new TokenStore();
+                var liveDocs = new RoaringBitmap();
+                long totalBytes = 0;
+
+                // Reused per token, growable.
+                var mergedBuffer = new List<ulong>(64);
+                var chunkList = new List<byte[]>(4);
+
+                while (pq.Count > 0)
+                {
+                    var reader = pq.Dequeue();
+                    FieldToken key = reader.CurrentKey;
+
+                    chunkList.Clear();
+                    chunkList.Add(reader.CurrentData);
+                    reader.Next();
+                    if (!reader.Finished) pq.Enqueue(reader, (reader.CurrentKey, reader.Order));
+
+                    while (pq.Count > 0 && pq.Peek().CurrentKey.Equals(key))
+                    {
+                        var nextReader = pq.Dequeue();
+                        chunkList.Add(nextReader.CurrentData);
+                        nextReader.Next();
+                        if (!nextReader.Finished) pq.Enqueue(nextReader, (nextReader.CurrentKey, nextReader.Order));
+                    }
+
+                    byte[] finalBytes;
+                    int docCount;
+                    if (chunkList.Count == 1 && dropDocs == null)
+                    {
+                        finalBytes = chunkList[0];
+                        docCount = CountDocs(finalBytes, liveDocs);
+                    }
+                    else
+                    {
+                        mergedBuffer.Clear();
+                        KWayMergePacked(chunkList, mergedBuffer, dropDocs, liveDocs, out docCount);
+                        // Allocate exactly one final buffer.
+                        finalBytes = new byte[mergedBuffer.Count * 8];
+                        MemoryMarshal.Cast<ulong, byte>(CollectionsMarshal.AsSpan(mergedBuffer)).CopyTo(finalBytes);
+                    }
+
+                    if (finalBytes.Length == 0)
+                    {
+                        // entirely-dropped token (e.g. all docs deleted) - skip emit
+                        continue;
+                    }
+
+                    // Write the posting list to the postings CF.
+                    var pkKey = Keys.PostingsKey(segmentId, key.Field, key.Token);
+                    batch.Put(pkKey, finalBytes, db.Postings);
+
+                    tokenStore.Add(key.Field, key.Token, finalBytes.Length / 8, docCount);
+                    totalBytes += finalBytes.Length;
+                }
+
+                // Persist the token map (single value per segment).
+                tokenStore.AddToBatch(batch, db.SegTokens, segmentId);
+
+                // Persist the live-docs bitmap.
+                batch.Put(Keys.SegIdKey(segmentId), liveDocs.SaveToBytes(), db.SegLiveDocs);
+
+                var info = new SegmentInfo
+                {
+                    Id = segmentId,
+                    SizeInBytes = totalBytes,
+                    DocCount = (int)liveDocs.Cardinality,
+                };
+                batch.Put(Keys.SegIdKey(segmentId), info.Serialize(), db.SegMeta);
+
+                if (ownBatch)
+                {
+                    db.Db.Write(batch);
+                }
+                return info;
             }
-
-            using var tokenStore = new TokenStore(dir, storage);
-            using var packedFile = storage.OpenWrite(storage.Combine(dir, "roaringish_packed.bin"));
-
-            // Track all unique doc ids seen across the segment (cheap roaring bitmap).
-            var liveDocs = new RoaringBitmap();
-
-            while (pq.Count > 0)
+            finally
             {
-                var reader = pq.Dequeue();
-                FieldToken key = reader.CurrentKey;
-
-                // 64-byte align for SIMD loads.
-                long currentPos = packedFile.Position;
-                long alignedPos = (currentPos + 63) & ~63;
-                if (alignedPos > currentPos)
-                {
-                    packedFile.Write(new byte[alignedPos - currentPos]);
-                }
-
-                long startOffset = packedFile.Position;
-                long totalLength = 0;
-                int docCount = 0;
-                uint lastDocId = uint.MaxValue;
-
-                // Collect all chunks for this key across readers in input order.
-                var chunks = new List<byte[]>();
-                chunks.Add(reader.CurrentData);
-                reader.Next();
-                if (!reader.Finished) pq.Enqueue(reader, (reader.CurrentKey, reader.Order));
-
-                while (pq.Count > 0 && pq.Peek().CurrentKey.Equals(key))
-                {
-                    var nextReader = pq.Dequeue();
-                    chunks.Add(nextReader.CurrentData);
-                    nextReader.Next();
-                    if (!nextReader.Finished) pq.Enqueue(nextReader, (nextReader.CurrentKey, nextReader.Order));
-                }
-
-                // The chunks are individually sorted by global doc id (each batch builds
-                // packed lists in order of incoming docs). When merging segments, all
-                // global doc ids are unique across segments because each commit only
-                // produces docs newer than prior segments. We still tolerate generic
-                // input by k-way merging by docId+group key.
-                if (chunks.Count == 1)
-                {
-                    var data = chunks[0];
-                    packedFile.Write(data);
-                    totalLength += data.Length;
-                    CountDocsInPacked(data, ref lastDocId, ref docCount, liveDocs);
-                }
-                else
-                {
-                    KWayMergePackedToFile(chunks, packedFile, ref totalLength, ref lastDocId, ref docCount, liveDocs);
-                }
-
-                tokenStore.Add(key.Field, key.Token, startOffset, totalLength, docCount);
+                if (ownBatch) batch.Dispose();
             }
-
-            packedFile.Flush();
-
-            // Persist the per-segment live-doc-ids bitmap. Used by the indexer when
-            // applying pending deletes (only counts deletes that match a doc actually
-            // in this segment) and by the searcher as a quick "any docs?" probe.
-            using (var s = storage.OpenWrite(storage.Combine(dir, "doc_ids.bin")))
-            {
-                liveDocs.Save(s);
-            }
-
-            return new SegmentInfo
-            {
-                SizeInBytes = SafePackedSize(storage, dir),
-                DocCount = (int)liveDocs.Cardinality,
-            };
         }
 
-        private static long SafePackedSize(ISimdStorage storage, string dir)
-        {
-            var path = storage.Combine(dir, "roaringish_packed.bin");
-            if (!storage.FileExists(path)) return 0;
-            using var s = storage.OpenRead(path);
-            return s.Length;
-        }
-
-        private static void CountDocsInPacked(byte[] data, ref uint lastDocId, ref int docCount, RoaringBitmap liveDocs)
+        private static int CountDocs(byte[] data, RoaringBitmap liveDocs)
         {
             var span = MemoryMarshal.Cast<byte, ulong>(data);
+            uint lastDocId = uint.MaxValue;
+            int count = 0;
             for (int i = 0; i < span.Length; i++)
             {
                 uint docId = RoaringishPacked.UnpackDocId(span[i]);
                 if (docId != lastDocId)
                 {
-                    docCount++;
+                    count++;
                     lastDocId = docId;
                 }
                 liveDocs.Add(docId);
             }
+            return count;
         }
 
-        // K-way merge of multiple packed byte arrays into the output file. Each ulong
-        // entry holds [docId(32) | group(16) | values(16)]. We sort by (docId,group) and
-        // OR overlapping value bitmaps.
-        private static void KWayMergePackedToFile(
-            List<byte[]> chunks, Stream output,
-            ref long totalLength, ref uint lastDocId, ref int docCount, RoaringBitmap liveDocs)
+        // K-way merge of multiple packed byte arrays into `output`. Each ulong
+        // entry holds [docId(32) | group(16) | values(16)]. We sort by (docId,group)
+        // and OR overlapping value bitmaps. Entries belonging to docs in `dropDocs`
+        // (used during compaction to drop deletes) are filtered out.
+        private static void KWayMergePacked(
+            List<byte[]> chunks,
+            List<ulong> output,
+            HashSet<uint> dropDocs,
+            RoaringBitmap liveDocs,
+            out int docCount)
         {
             int n = chunks.Count;
+            var indices = new int[n];
             var spans = new ulong[n][];
-            var idx = new int[n];
             for (int i = 0; i < n; i++)
             {
                 spans[i] = new ulong[chunks[i].Length / 8];
@@ -227,13 +214,8 @@ namespace SimdPhrase2.Segments
             ulong currentKey = 0;
             ulong currentValues = 0;
             bool hasCurrent = false;
-
-            const int BufBytes = 1 << 16;
-            var buf = new byte[BufBytes];
-            int bufPos = 0;
-            long bytesWritten = 0;
-            uint lastDoc = lastDocId;
-            int docs = docCount;
+            uint lastDoc = uint.MaxValue;
+            int docs = 0;
 
             while (true)
             {
@@ -242,45 +224,42 @@ namespace SimdPhrase2.Segments
                 ulong minVal = 0;
                 for (int r = 0; r < n; r++)
                 {
-                    if (idx[r] >= spans[r].Length) continue;
-                    ulong p = spans[r][idx[r]];
-                    ulong key = RoaringishPacked.ClearValues(p);
-                    if (minR == -1 || key < minKey)
+                    if (indices[r] >= spans[r].Length) continue;
+                    ulong p = spans[r][indices[r]];
+                    ulong k = RoaringishPacked.ClearValues(p);
+                    if (minR == -1 || k < minKey)
                     {
-                        minR = r; minKey = key; minVal = (ulong)RoaringishPacked.UnpackValues(p);
+                        minR = r; minKey = k; minVal = (ulong)RoaringishPacked.UnpackValues(p);
                     }
                 }
                 if (minR == -1) break;
-                idx[minR]++;
+                indices[minR]++;
+
+                // Drop entries belonging to deleted docs.
+                if (dropDocs != null)
+                {
+                    uint docId = RoaringishPacked.UnpackDocId(minKey);
+                    if (dropDocs.Contains(docId)) continue;
+                }
+
                 if (!hasCurrent) { currentKey = minKey; currentValues = minVal; hasCurrent = true; }
                 else if (minKey == currentKey) { currentValues |= minVal; }
                 else
                 {
-                    EmitEntry(currentKey | currentValues, output, buf, ref bufPos, ref bytesWritten, ref lastDoc, ref docs, liveDocs);
+                    Emit(currentKey | currentValues, output, liveDocs, ref lastDoc, ref docs);
                     currentKey = minKey; currentValues = minVal;
                 }
             }
             if (hasCurrent)
             {
-                EmitEntry(currentKey | currentValues, output, buf, ref bufPos, ref bytesWritten, ref lastDoc, ref docs, liveDocs);
+                Emit(currentKey | currentValues, output, liveDocs, ref lastDoc, ref docs);
             }
-            if (bufPos > 0) { output.Write(buf, 0, bufPos); bytesWritten += bufPos; bufPos = 0; }
-
-            totalLength += bytesWritten;
-            lastDocId = lastDoc;
             docCount = docs;
         }
 
-        private static void EmitEntry(ulong packed, Stream output, byte[] buf, ref int bufPos, ref long bytesWritten, ref uint lastDoc, ref int docs, RoaringBitmap liveDocs)
+        private static void Emit(ulong packed, List<ulong> output, RoaringBitmap liveDocs, ref uint lastDoc, ref int docs)
         {
-            if (bufPos + 8 > buf.Length)
-            {
-                output.Write(buf, 0, bufPos);
-                bytesWritten += bufPos;
-                bufPos = 0;
-            }
-            BitConverter.TryWriteBytes(buf.AsSpan(bufPos, 8), packed);
-            bufPos += 8;
+            output.Add(packed);
             uint docId = RoaringishPacked.UnpackDocId(packed);
             if (docId != lastDoc)
             {
@@ -327,88 +306,72 @@ namespace SimdPhrase2.Segments
                 var kvp = _items[_pos++];
                 CurrentKey = kvp.Key;
                 var span = kvp.Value.AsSpan();
+                // Allocate exactly the bytes we need, in one chunk.
                 var bytes = new byte[span.Length * 8];
                 MemoryMarshal.Cast<ulong, byte>(span).CopyTo(bytes);
                 CurrentData = bytes;
             }
 
-            public void Dispose() { /* RoaringishPacked instances are owned by the caller */ }
+            public void Dispose() { }
         }
 
-        // Reader over a batch_<n>.bin file produced by the indexer.
-        // Format: repeated [byte field][string token][int len][len*8 bytes].
-        private sealed class BatchFileReader : ISegmentInputReader
+        // Reader over an existing segment's `postings` rows, iterating the postings
+        // CF with a prefix scoped to the segment id - this yields entries in
+        // (field, token) order without ever materializing the whole segment.
+        // Entries for deleted doc ids are filtered out at emit time.
+        private sealed class SegmentPostingsIteratorReader : ISegmentInputReader
         {
             public int Order { get; }
             public FieldToken CurrentKey { get; private set; }
             public byte[] CurrentData { get; private set; }
             public bool Finished { get; private set; }
 
-            private readonly Stream _fs;
-            private readonly BinaryReader _br;
-
-            public BatchFileReader(ISimdStorage storage, string path, int order)
-            {
-                Order = order;
-                _fs = storage.OpenRead(path);
-                _br = new BinaryReader(_fs);
-                Next();
-            }
-
-            public void Next()
-            {
-                if (_fs.Position >= _fs.Length) { Finished = true; CurrentKey = default; CurrentData = null; return; }
-                try
-                {
-                    byte field = _br.ReadByte();
-                    string token = _br.ReadString();
-                    int len = _br.ReadInt32();
-                    CurrentKey = new FieldToken(field, token);
-                    CurrentData = _br.ReadBytes(len * 8);
-                }
-                catch (EndOfStreamException)
-                {
-                    Finished = true;
-                }
-            }
-
-            public void Dispose() { _br.Dispose(); _fs.Dispose(); }
-        }
-
-        // Reader over a fully built SegmentReader. Iterates entries in sorted order
-        // (by field then token). For each entry, reads the matching slice of the
-        // packed file, applying the deletes bitmap by dropping entries that belong
-        // to deleted doc IDs.
-        private sealed class SegmentTokenReader : ISegmentInputReader
-        {
-            public int Order { get; }
-            public FieldToken CurrentKey { get; private set; }
-            public byte[] CurrentData { get; private set; }
-            public bool Finished { get; private set; }
-
+            private readonly SimdPhraseDb _db;
             private readonly SegmentReader _segment;
-            private readonly List<FieldToken> _keys;
-            private int _pos;
+            private readonly Iterator _iter;
+            private readonly byte[] _prefix;
 
-            public SegmentTokenReader(SegmentReader segment, int order)
+            public SegmentPostingsIteratorReader(SimdPhraseDb db, SegmentReader segment, int order)
             {
-                Order = order;
+                _db = db;
                 _segment = segment;
-                _keys = new List<FieldToken>(segment.Tokens.GetAllEntries());
-                _keys.Sort();
-                Next();
+                Order = order;
+                _prefix = Keys.PostingsSegmentPrefix(segment.Id);
+                _iter = db.Db.NewIterator(db.Postings);
+                _iter.Seek(_prefix);
+                Advance();
             }
 
-            public void Next()
+            private void Advance()
             {
-                while (_pos < _keys.Count)
+                while (_iter.Valid())
                 {
-                    var key = _keys[_pos++];
-                    if (!_segment.Tokens.TryGet(key.Field, key.Token, out var offset)) continue;
-                    using var packed = _segment.LoadPacked(offset);
-                    var data = ApplyDeletes(packed.AsSpan(), _segment.Deletes);
+                    var keySpan = _iter.GetKeySpan();
+                    if (keySpan.Length < _prefix.Length || !keySpan.Slice(0, _prefix.Length).SequenceEqual(_prefix))
+                    {
+                        // moved past the segment.
+                        Finished = true;
+                        CurrentKey = default;
+                        CurrentData = null;
+                        return;
+                    }
+                    Keys.ParsePostingsKey(keySpan, out _, out byte field, out string token);
+
+                    var valSpan = _iter.GetValueSpan();
+                    byte[] data;
+                    if (_segment.Deletes.IsEmpty)
+                    {
+                        data = valSpan.ToArray();
+                    }
+                    else
+                    {
+                        data = ApplyDeletes(valSpan, _segment.Deletes);
+                    }
+                    _iter.Next();
+
                     if (data.Length == 0) continue; // entirely deleted
-                    CurrentKey = key;
+
+                    CurrentKey = new FieldToken(field, token);
                     CurrentData = data;
                     return;
                 }
@@ -417,21 +380,16 @@ namespace SimdPhrase2.Segments
                 CurrentData = null;
             }
 
-            public void Dispose() { /* SegmentReader is owned externally */ }
+            public void Next() => Advance();
+
+            public void Dispose() => _iter.Dispose();
 
             // Filter out entries belonging to deleted docs. Each ulong is one packed
             // group of up to 16 positions for one (docId, group) pair, so we either
-            // keep the whole group (live doc) or drop it (deleted doc). This means
-            // deleted doc IDs leave no trace in the merged segment.
-            private static byte[] ApplyDeletes(Span<ulong> packed, RoaringBitmap deletes)
+            // keep the whole group (live doc) or drop it (deleted doc).
+            private static byte[] ApplyDeletes(ReadOnlySpan<byte> packedBytes, RoaringBitmap deletes)
             {
-                if (deletes.IsEmpty)
-                {
-                    var bytes = new byte[packed.Length * 8];
-                    MemoryMarshal.Cast<ulong, byte>(packed).CopyTo(bytes);
-                    return bytes;
-                }
-
+                var packed = MemoryMarshal.Cast<byte, ulong>(packedBytes);
                 int kept = 0;
                 for (int i = 0; i < packed.Length; i++)
                 {
@@ -439,17 +397,23 @@ namespace SimdPhrase2.Segments
                     if (!deletes.Contains(docId)) kept++;
                 }
                 if (kept == 0) return Array.Empty<byte>();
+                if (kept == packed.Length)
+                {
+                    // No deletes hit this list: just copy the bytes through.
+                    var copy = new byte[packedBytes.Length];
+                    packedBytes.CopyTo(copy);
+                    return copy;
+                }
 
-                var outArr = new ulong[kept];
+                var outArr = new byte[kept * 8];
+                Span<ulong> outUlong = MemoryMarshal.Cast<byte, ulong>(outArr.AsSpan());
                 int j = 0;
                 for (int i = 0; i < packed.Length; i++)
                 {
                     uint docId = RoaringishPacked.UnpackDocId(packed[i]);
-                    if (!deletes.Contains(docId)) outArr[j++] = packed[i];
+                    if (!deletes.Contains(docId)) outUlong[j++] = packed[i];
                 }
-                var bytes2 = new byte[outArr.Length * 8];
-                Buffer.BlockCopy(outArr, 0, bytes2, 0, bytes2.Length);
-                return bytes2;
+                return outArr;
             }
         }
     }

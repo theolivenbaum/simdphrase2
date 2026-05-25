@@ -1,6 +1,7 @@
 using System;
-using System.IO;
-using System.Text.Json;
+using System.Buffers.Binary;
+using System.Text;
+using RocksDbSharp;
 using SimdPhrase2.Storage;
 
 namespace SimdPhrase2.Db
@@ -19,31 +20,68 @@ namespace SimdPhrase2.Db
         // length for BM25/BM25F. Length matches FieldCount.
         public ulong[] TotalTokensPerField { get; set; } = new ulong[] { 0 };
 
-        public static void Save(ISimdStorage storage, string path, IndexStats stats)
+        // Compact binary on-disk format (stored as a single meta-CF value):
+        //   [byte version=1][uint32 totalDocs][uint64 totalTokens]
+        //   [int32 fieldCount][uint64 totalTokensPerField[fieldCount]]
+        // Little-endian throughout.
+
+        public byte[] Serialize()
         {
-            // Keep the on-disk representation tolerant of older shapes: only
-            // serialise the per-field array when it's non-trivial. (System.Text.Json
-            // is happy to round-trip either way; the field check is just so a
-            // single-field index doesn't grow a noisy stats file.)
-            var json = JsonSerializer.Serialize(stats);
-            storage.WriteAllText(path, json);
+            int size = 1 + 4 + 8 + 4 + 8 * FieldCount;
+            var buf = new byte[size];
+            var span = buf.AsSpan();
+            span[0] = 1;
+            BinaryPrimitives.WriteUInt32LittleEndian(span.Slice(1, 4), TotalDocs);
+            BinaryPrimitives.WriteUInt64LittleEndian(span.Slice(5, 8), TotalTokens);
+            BinaryPrimitives.WriteInt32LittleEndian(span.Slice(13, 4), FieldCount);
+            for (int i = 0; i < FieldCount; i++)
+            {
+                ulong v = (TotalTokensPerField != null && i < TotalTokensPerField.Length) ? TotalTokensPerField[i] : 0UL;
+                BinaryPrimitives.WriteUInt64LittleEndian(span.Slice(17 + i * 8, 8), v);
+            }
+            return buf;
         }
 
-        public static IndexStats Load(ISimdStorage storage, string path)
+        public static IndexStats Deserialize(ReadOnlySpan<byte> bytes)
         {
-            if (!storage.FileExists(path)) return new IndexStats();
-            var json = storage.ReadAllText(path);
-            var stats = JsonSerializer.Deserialize<IndexStats>(json) ?? new IndexStats();
-
-            if (stats.FieldCount <= 0) stats.FieldCount = 1;
-            if (stats.TotalTokensPerField == null || stats.TotalTokensPerField.Length != stats.FieldCount)
+            if (bytes.Length < 17) return new IndexStats();
+            byte version = bytes[0];
+            if (version != 1) throw new InvalidOperationException($"Unsupported IndexStats version {version}.");
+            uint totalDocs = BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(1, 4));
+            ulong totalTokens = BinaryPrimitives.ReadUInt64LittleEndian(bytes.Slice(5, 8));
+            int fieldCount = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(13, 4));
+            if (fieldCount <= 0) fieldCount = 1;
+            var perField = new ulong[fieldCount];
+            for (int i = 0; i < fieldCount; i++)
             {
-                // Older stats files only stored the aggregate. Fold it into field 0.
-                var perField = new ulong[stats.FieldCount];
-                if (stats.FieldCount > 0) perField[0] = stats.TotalTokens;
-                stats.TotalTokensPerField = perField;
+                int off = 17 + i * 8;
+                if (off + 8 > bytes.Length) break;
+                perField[i] = BinaryPrimitives.ReadUInt64LittleEndian(bytes.Slice(off, 8));
             }
-            return stats;
+            return new IndexStats
+            {
+                TotalDocs = totalDocs,
+                TotalTokens = totalTokens,
+                FieldCount = fieldCount,
+                TotalTokensPerField = perField,
+            };
+        }
+
+        public static IndexStats Load(SimdPhraseDb db)
+        {
+            var bytes = db.Db.Get(Encoding.UTF8.GetBytes(SimdPhraseDb.MetaKeyStats), db.Meta);
+            if (bytes == null) return new IndexStats();
+            return Deserialize(bytes);
+        }
+
+        public void Save(SimdPhraseDb db)
+        {
+            db.Db.Put(Encoding.UTF8.GetBytes(SimdPhraseDb.MetaKeyStats), Serialize(), db.Meta);
+        }
+
+        public void AddToBatch(WriteBatch batch, ColumnFamilyHandle metaCf)
+        {
+            batch.Put(Encoding.UTF8.GetBytes(SimdPhraseDb.MetaKeyStats), Serialize(), metaCf);
         }
     }
 }
