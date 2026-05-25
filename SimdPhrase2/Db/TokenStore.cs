@@ -12,10 +12,42 @@ namespace SimdPhrase2.Db
         public int DocCount;
     }
 
+    // Composite key identifying a posting list inside a segment: the field index
+    // (0..255) plus the textual token. Stored as a struct (and not a string-prefixed
+    // form) so the field byte and the token retain their own types throughout the
+    // hot paths - the token comparisons that drive the k-way merge stay on the bare
+    // string, and the field byte is a simple ordinal.
+    public readonly struct FieldToken : IEquatable<FieldToken>, IComparable<FieldToken>
+    {
+        public readonly byte Field;
+        public readonly string Token;
+
+        public FieldToken(byte field, string token)
+        {
+            Field = field;
+            Token = token;
+        }
+
+        public bool Equals(FieldToken other) => Field == other.Field && string.Equals(Token, other.Token, StringComparison.Ordinal);
+        public override bool Equals(object obj) => obj is FieldToken o && Equals(o);
+        public override int GetHashCode() => HashCode.Combine(Field, Token);
+
+        public int CompareTo(FieldToken other)
+        {
+            int cmp = Field.CompareTo(other.Field);
+            if (cmp != 0) return cmp;
+            return string.CompareOrdinal(Token, other.Token);
+        }
+
+        public override string ToString() => $"[{Field}]{Token}";
+    }
+
     public class TokenStore : IDisposable
     {
+        private const int Version = 2;
+
         private readonly string _path;
-        private Dictionary<string, FileOffset> _map;
+        private Dictionary<FieldToken, FileOffset> _map;
         private bool _dirty;
         private readonly ISimdStorage _storage;
 
@@ -23,7 +55,7 @@ namespace SimdPhrase2.Db
         {
             _storage = storage ?? new FileSystemStorage();
             _path = _storage.Combine(basePath, "token_map.bin");
-            _map = new Dictionary<string, FileOffset>();
+            _map = new Dictionary<FieldToken, FileOffset>();
             Load();
         }
 
@@ -35,34 +67,26 @@ namespace SimdPhrase2.Db
 
             try
             {
+                int version = reader.ReadInt32();
+                if (version != Version)
+                {
+                    // Incompatible on-disk format - the caller is expected to rebuild the index.
+                    throw new InvalidDataException($"TokenStore version mismatch: file is {version}, code expects {Version}.");
+                }
                 int count = reader.ReadInt32();
                 for (int i = 0; i < count; i++)
                 {
+                    byte field = reader.ReadByte();
                     string token = reader.ReadString();
                     long begin = reader.ReadInt64();
                     long len = reader.ReadInt64();
-                    int docCount = 0;
-                    // Backward compatibility check could be here, but we are rewriting.
-                    // Assuming fresh index or rebuilt index.
-                    // For safety, checking stream position? No, binary format doesn't support versioning yet.
-                    // We assume the user will re-index.
-                    try
-                    {
-                        docCount = reader.ReadInt32();
-                    }
-                    catch (EndOfStreamException)
-                    {
-                         // If we are reading an old index, we might hit EOF here if we are strict.
-                         // But for now we just proceed. Old indices will be incompatible.
-                         docCount = 0;
-                    }
-
-                    _map[token] = new FileOffset { Begin = begin, Length = len, DocCount = docCount };
+                    int docCount = reader.ReadInt32();
+                    _map[new FieldToken(field, token)] = new FileOffset { Begin = begin, Length = len, DocCount = docCount };
                 }
             }
             catch (EndOfStreamException)
             {
-                // corrupted or partial write
+                // partial write - tolerate
             }
         }
 
@@ -72,10 +96,12 @@ namespace SimdPhrase2.Db
             using var fs = _storage.OpenWrite(_path);
             using var writer = new BinaryWriter(fs);
 
+            writer.Write(Version);
             writer.Write(_map.Count);
             foreach (var kvp in _map)
             {
-                writer.Write(kvp.Key);
+                writer.Write(kvp.Key.Field);
+                writer.Write(kvp.Key.Token);
                 writer.Write(kvp.Value.Begin);
                 writer.Write(kvp.Value.Length);
                 writer.Write(kvp.Value.DocCount);
@@ -83,20 +109,32 @@ namespace SimdPhrase2.Db
             _dirty = false;
         }
 
-        public void Add(string token, long begin, long length, int docCount)
+        public void Add(byte field, string token, long begin, long length, int docCount)
         {
-            _map[token] = new FileOffset { Begin = begin, Length = length, DocCount = docCount };
+            _map[new FieldToken(field, token)] = new FileOffset { Begin = begin, Length = length, DocCount = docCount };
             _dirty = true;
         }
 
-        public bool TryGet(string token, out FileOffset offset)
+        // Backward-compatible: defaults to field 0.
+        public void Add(string token, long begin, long length, int docCount)
+            => Add(0, token, begin, length, docCount);
+
+        public bool TryGet(byte field, string token, out FileOffset offset)
         {
-            return _map.TryGetValue(token, out offset);
+            return _map.TryGetValue(new FieldToken(field, token), out offset);
         }
 
+        // Backward-compatible shorthand: looks up in field 0.
+        public bool TryGet(string token, out FileOffset offset) => TryGet(0, token, out offset);
+
+        public IEnumerable<FieldToken> GetAllEntries() => _map.Keys;
+
+        // Legacy enumeration of token strings (assumes field 0). Kept for tests
+        // that exercise the field-less surface.
         public IEnumerable<string> GetAllTokens()
         {
-            return _map.Keys;
+            foreach (var k in _map.Keys)
+                if (k.Field == 0) yield return k.Token;
         }
 
         public void Dispose()
