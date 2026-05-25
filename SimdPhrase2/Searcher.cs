@@ -161,15 +161,42 @@ namespace SimdPhrase2
             return result;
         }
 
+        // Tokenize a query string, collapsing dual-emitted alternate surface forms (the
+        // tokenizer emits both the original and the lowercased form at the same token
+        // index for words containing uppercase letters, to support lemmatization-style
+        // multi-token-per-position indexing). At query time we want one canonical form
+        // per position - we keep the LAST emitted token at each index, which is the
+        // lowercased/lemma form per the BasicTokenizer contract. The indexer stores
+        // both forms, so the lowercase variant matches both case-variant doc inputs.
+        // Without this collapse, "A" would tokenize to ["A","a"] at the same index and
+        // Search would phrase-intersect them as if they were sequential tokens - which
+        // never matches because they share a position.
+        private List<string> TokenizeQuery(string query)
+        {
+            var rawTokens = new List<string>();
+            var enumerator = _tokenizer.Tokenize(query.AsSpan()).GetEnumerator();
+            uint lastIndex = uint.MaxValue;
+            while (enumerator.MoveNext())
+            {
+                string tokenStr = enumerator.Current.ToString();
+                if (rawTokens.Count > 0 && enumerator.CurrentIndex == lastIndex)
+                {
+                    rawTokens[rawTokens.Count - 1] = tokenStr;
+                }
+                else
+                {
+                    rawTokens.Add(tokenStr);
+                    lastIndex = enumerator.CurrentIndex;
+                }
+            }
+            return rawTokens;
+        }
+
         public List<uint> Search(string query)
         {
             if (_segments.Count == 0) return new List<uint>();
 
-            var rawTokens = new List<string>();
-            foreach (var t in _tokenizer.Tokenize(query.AsSpan()))
-            {
-                rawTokens.Add(t.ToString());
-            }
+            var rawTokens = TokenizeQuery(query);
             if (rawTokens.Count == 0) return new List<uint>();
 
             var tokens = MergeAndMinimizeTokens(rawTokens);
@@ -361,9 +388,22 @@ namespace SimdPhrase2
 
             if (msbLen1 == 0)
             {
+                // The SIMD/Naive first-pass kernels write a (docIdGroup | 0) entry whenever
+                // two docIdGroups match but the phrase intersection is empty (e.g. "is" at
+                // position 2 and "a" at position 0 of the same doc). MergeResults filters
+                // those out when msbLen1 > 0, but the no-MSB-carry early-return path here
+                // bypasses MergeResults, so we replicate the same values > 0 filter inline.
+                // The Gallop kernels already guard their write with intersection > 0.
+                var src = packedResult.AsSpan(0, packedLen1);
                 var ret = new RoaringishPacked(packedLen1);
-                ret.Buffer.SetLength(packedLen1);
-                packedResult.AsSpan(0, packedLen1).CopyTo(ret.Buffer.AsSpan());
+                var dst = ret.Buffer;
+                for (int k = 0; k < src.Length; k++)
+                {
+                    if (RoaringishPacked.UnpackValues(src[k]) > 0)
+                    {
+                        dst.Add(src[k]);
+                    }
+                }
                 return ret;
             }
 
@@ -419,11 +459,7 @@ namespace SimdPhrase2
         {
             if (_segments.Count == 0) return new List<(uint, float)>();
 
-            var tokens = new List<string>();
-            foreach (var t in _tokenizer.Tokenize(query.AsSpan()))
-            {
-                tokens.Add(t.ToString());
-            }
+            var tokens = TokenizeQuery(query);
             if (tokens.Count == 0) return new List<(uint, float)>();
 
             var scores = new Dictionary<uint, float>();
