@@ -38,40 +38,34 @@ namespace SimdPhrase2.Tests
                 indexer.Index(docs);
             }
 
-            // Verify IndexStats
-            var statsPath = Path.Combine(_indexName, "index_stats.json");
-            Assert.True(File.Exists(statsPath));
-            var stats = IndexStats.Load(new FileSystemStorage(), statsPath);
-            Assert.Equal(3u, stats.TotalDocs);
-            Assert.Equal(7ul, stats.TotalTokens);
-
-            // Verify DocLengths
-            var docLengthsPath = Path.Combine(_indexName, "doc_lengths.bin");
-            Assert.True(File.Exists(docLengthsPath));
-            using (var fs = File.OpenRead(docLengthsPath))
-            using (var br = new BinaryReader(fs))
+            using (var db = SimdPhraseDb.Open(_indexName))
             {
-                Assert.Equal(12, fs.Length); // 3 docs * 4 bytes
-                Assert.Equal(2, br.ReadInt32());
-                Assert.Equal(2, br.ReadInt32());
-                Assert.Equal(3, br.ReadInt32());
-            }
+                // Verify IndexStats persisted in the meta CF.
+                var stats = IndexStats.Load(db);
+                Assert.Equal(3u, stats.TotalDocs);
+                Assert.Equal(7ul, stats.TotalTokens);
 
-            // Verify TokenStore counts (tokens now live in segments)
-            var storage = new FileSystemStorage();
-            var manifest = SegmentManifest.Load(storage, _indexName);
-            Assert.Single(manifest.Segments);
-            int helloDocs = 0, worldDocs = 0, universeDocs = 0;
-            foreach (var seg in manifest.Segments)
-            {
-                using var sr = new SegmentReader(storage, _indexName, seg);
-                if (sr.Tokens.TryGet("hello", out var off1)) helloDocs += off1.DocCount;
-                if (sr.Tokens.TryGet("world", out var off2)) worldDocs += off2.DocCount;
-                if (sr.Tokens.TryGet("universe", out var off3)) universeDocs += off3.DocCount;
+                // Verify DocLengths in the doc_lengths CF.
+                var lens = new DocLengthStore(db, stats.FieldCount);
+                Assert.Equal(2, lens.GetLength(0, 0));
+                Assert.Equal(2, lens.GetLength(1, 0));
+                Assert.Equal(3, lens.GetLength(2, 0));
+
+                // Verify TokenStore counts (tokens now live in segments).
+                var manifest = SegmentManifest.Load(db);
+                Assert.Single(manifest.Segments);
+                int helloDocs = 0, worldDocs = 0, universeDocs = 0;
+                foreach (var seg in manifest.Segments)
+                {
+                    using var sr = new SegmentReader(db, seg);
+                    if (sr.Tokens.TryGet("hello", out var off1)) helloDocs += off1.DocCount;
+                    if (sr.Tokens.TryGet("world", out var off2)) worldDocs += off2.DocCount;
+                    if (sr.Tokens.TryGet("universe", out var off3)) universeDocs += off3.DocCount;
+                }
+                Assert.Equal(3, helloDocs);
+                Assert.Equal(2, worldDocs);
+                Assert.Equal(1, universeDocs);
             }
-            Assert.Equal(3, helloDocs);
-            Assert.Equal(2, worldDocs);
-            Assert.Equal(1, universeDocs);
         }
     }
 }

@@ -1,9 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Buffers.Binary;
 using SimdPhrase2.Db;
 using SimdPhrase2.Queries;
 using SimdPhrase2.Roaringish;
@@ -15,13 +13,17 @@ namespace SimdPhrase2
 {
     public class Searcher : IDisposable
     {
-        private readonly string _indexName;
+        private readonly string _indexPath;
         private DocumentStore _docStore;
+        private DocLengthStore _docLengthStore;
         private IIntersect _intersect;
         private Stats _stats;
         private HashSet<string> _commonTokens;
         private ITextTokenizer _tokenizer;
-        private ISimdStorage _storage;
+
+        // RocksDB handle - this Searcher owns it unless the caller passed one in.
+        private readonly SimdPhraseDb _db;
+        private readonly bool _ownsDb;
 
         private List<SegmentReader> _segments;
         // Aggregated total length per (field, token) across all segments, lazily filled and cached.
@@ -29,31 +31,37 @@ namespace SimdPhrase2
         private Dictionary<FieldToken, long> _tokenLengthCache;
 
         // BM25 / Boolean support
-        private Stream? _docLengthsStream;
         private IndexStats _indexStats;
         private readonly int _fieldCount;
         private readonly float[] _avgDocLengthPerField;
 
         public int FieldCount => _fieldCount;
+        public SimdPhraseDb Db => _db;
 
-        public Searcher(string indexName, bool forceNaive = false, ITextTokenizer tokenizer = null, ISimdStorage storage = null)
+        public Searcher(string indexPath, bool forceNaive = false, ITextTokenizer tokenizer = null, SimdPhraseDb db = null)
         {
-            _indexName = indexName;
+            _indexPath = indexPath;
             _tokenizer = tokenizer ?? new BasicTokenizer();
-            _storage = storage ?? new FileSystemStorage();
-            _docStore = new DocumentStore(indexName, _storage);
             _intersect = forceNaive ? new NaiveIntersect() : new SimdIntersect();
             _stats = new Stats();
-            _commonTokens = CommonTokensPersistence.Load(_storage, _storage.Combine(indexName, "common_tokens.bin"));
             _tokenLengthCache = new Dictionary<FieldToken, long>();
 
-            string docLengthsPath = _storage.Combine(indexName, "doc_lengths.bin");
-            if (_storage.FileExists(docLengthsPath))
-                _docLengthsStream = _storage.OpenRead(docLengthsPath);
+            if (db != null)
+            {
+                _db = db;
+                _ownsDb = false;
+            }
+            else
+            {
+                _db = SimdPhraseDb.Open(indexPath);
+                _ownsDb = true;
+            }
+            _docStore = new DocumentStore(_db);
+            _commonTokens = CommonTokensPersistence.Load(_db);
 
-            string statsPath = _storage.Combine(indexName, "index_stats.json");
-            _indexStats = IndexStats.Load(_storage, statsPath);
+            _indexStats = IndexStats.Load(_db);
             _fieldCount = _indexStats.FieldCount > 0 ? _indexStats.FieldCount : 1;
+            _docLengthStore = new DocLengthStore(_db, _fieldCount);
             _avgDocLengthPerField = new float[_fieldCount];
             if (_indexStats.TotalDocs > 0)
             {
@@ -67,10 +75,10 @@ namespace SimdPhrase2
             }
 
             _segments = new List<SegmentReader>();
-            var manifest = SegmentManifest.Load(_storage, _indexName);
+            var manifest = SegmentManifest.Load(_db);
             foreach (var seg in manifest.Segments)
             {
-                _segments.Add(new SegmentReader(_storage, _indexName, seg));
+                _segments.Add(new SegmentReader(_db, seg));
             }
         }
 
@@ -176,12 +184,7 @@ namespace SimdPhrase2
             return result;
         }
 
-        // Tokenize a query string, collapsing dual-emitted alternate surface forms (the
-        // tokenizer emits both the original and the lowercased form at the same token
-        // index for words containing uppercase letters, to support lemmatization-style
-        // multi-token-per-position indexing). At query time we want one canonical form
-        // per position - we keep the LAST emitted token at each index, which is the
-        // lowercased/lemma form per the BasicTokenizer contract.
+        // Tokenize a query string, collapsing dual-emitted alternate surface forms.
         private List<string> TokenizeQuery(string query)
         {
             var rawTokens = new List<string>();
@@ -246,10 +249,6 @@ namespace SimdPhrase2
             return output;
         }
 
-        // Runs the phrase intersection for the given (field, token-list) against a
-        // single segment, appending matching live doc ids into `output`. The SIMD
-        // intersect kernel is unchanged - the field byte only affects how posting
-        // lists are looked up in the segment's TokenStore.
         private void SearchSegment(SegmentReader seg, byte field, List<string> tokens, List<uint> output)
         {
             var packedTokens = new List<(string Token, RoaringishPacked Packed)>();
@@ -261,7 +260,7 @@ namespace SimdPhrase2
                     {
                         return;
                     }
-                    packedTokens.Add((token, seg.LoadPacked(offset)));
+                    packedTokens.Add((token, seg.LoadPacked(field, token, offset)));
                 }
 
                 if (packedTokens.Count == 1)
@@ -322,9 +321,7 @@ namespace SimdPhrase2
         }
 
         // Appends the unique doc ids from `packed` into `output`, skipping any doc id
-        // present in `deletes`. The fast path (no deletes) delegates to the
-        // buffer-appending RoaringishPacked.GetDocIds overload; the slow path walks
-        // the packed span once and filters inline, avoiding a temporary list.
+        // present in `deletes`.
         private static void AppendDocIdsFiltered(RoaringishPacked packed, RoaringBitmap deletes, List<uint> output)
         {
             if (deletes.IsEmpty)
@@ -388,12 +385,6 @@ namespace SimdPhrase2
 
             if (msbLen1 == 0)
             {
-                // The SIMD/Naive first-pass kernels write a (docIdGroup | 0) entry whenever
-                // two docIdGroups match but the phrase intersection is empty (e.g. "is" at
-                // position 2 and "a" at position 0 of the same doc). MergeResults filters
-                // those out when msbLen1 > 0, but the no-MSB-carry early-return path here
-                // bypasses MergeResults, so we replicate the same values > 0 filter inline.
-                // The Gallop kernels already guard their write with intersection > 0.
                 var src = packedResult.AsSpan(0, packedLen1);
                 var ret = new RoaringishPacked(packedLen1);
                 var dst = ret.Buffer;
@@ -435,35 +426,20 @@ namespace SimdPhrase2
         public void Dispose()
         {
             foreach (var s in _segments) s.Dispose();
-            _docStore.Dispose();
-            _docLengthsStream?.Dispose();
+            if (_ownsDb) _db.Dispose();
         }
 
         public string GetDocument(uint docId) => _docStore.GetDocument(docId);
 
         // --- BM25 Implementation ---
 
-        // Per-field doc length lookup. doc_lengths.bin layout: 4*FieldCount bytes per
-        // doc id, slot-indexed by field.
-        private int GetDocLength(uint docId, byte field)
-        {
-            if (_docLengthsStream == null) return 0;
-            long pos = (long)docId * 4L * _fieldCount + field * 4L;
-            if (pos + 4 > _docLengthsStream.Length) return 0;
-            _docLengthsStream.Seek(pos, SeekOrigin.Begin);
-            Span<byte> buffer = stackalloc byte[4];
-            int read = _docLengthsStream.Read(buffer);
-            if (read < 4) return 0;
-            return BinaryPrimitives.ReadInt32LittleEndian(buffer);
-        }
+        // Per-field doc length lookup. Backed by the doc_lengths column family.
+        private int GetDocLength(uint docId, byte field) => _docLengthStore.GetLength(docId, field);
 
         // Legacy single-field BM25 search: tokens, no Query AST.
         public List<(uint DocId, float Score)> SearchBM25(string query, int k = 10, float k1 = 1.2f, float b = 0.75f)
             => SearchBM25(new TermsBM25Query(0, TokenizeQuery(query)), k, k1, b);
 
-        // BM25 search over a composable Query tree. Combines doc sets according to
-        // the AST and sums per-term BM25 contributions, scaled by any BoostQuery
-        // boosts on the path.
         public List<(uint DocId, float Score)> SearchBM25(Queries.Query query, int k = 10, float k1 = 1.2f, float b = 0.75f)
         {
             if (_segments.Count == 0) return new List<(uint, float)>();
@@ -489,7 +465,6 @@ namespace SimdPhrase2
             return docs.OrderBy(x => x).ToList();
         }
 
-        // Legacy parser-backed Boolean search (kept for backward compatibility).
         public List<uint> SearchBoolean(string query)
         {
             var parser = new BooleanQueryParser();
@@ -505,16 +480,6 @@ namespace SimdPhrase2
             return results.OrderBy(x => x).ToList();
         }
 
-        // BM25-scored Boolean search over a string query. Parses with
-        // BooleanQueryParser (supporting AND / OR / NOT / parentheses / implicit AND)
-        // and ranks the matching docs with the same BM25 scorer used by SearchBM25.
-        //
-        // Lucene's BooleanQuery+BM25Similarity served as the conceptual model:
-        // each non-negated clause contributes a BM25 sub-score, those scores are
-        // summed per matching doc, and MUST_NOT clauses only filter the doc set.
-        // We deliberately do not replicate Lucene's deprecated coord factor or its
-        // scorer/iterator plumbing - the implementation here is a thin shim that
-        // reuses the existing EvaluateScore over the modern Query AST.
         public List<(uint DocId, float Score)> SearchBooleanBM25(string query, int k = 10, float k1 = 1.2f, float b = 0.75f)
         {
             var parser = new BooleanQueryParser();
@@ -523,7 +488,6 @@ namespace SimdPhrase2
             return SearchBooleanBM25(root, k, k1, b);
         }
 
-        // BM25-scored Boolean search over a legacy QueryNode tree.
         public List<(uint DocId, float Score)> SearchBooleanBM25(QueryNode root, int k = 10, float k1 = 1.2f, float b = 0.75f)
         {
             if (root == null) return new List<(uint, float)>();
@@ -531,13 +495,6 @@ namespace SimdPhrase2
             return SearchBM25(ast, k, k1, b);
         }
 
-        // Lift a legacy parser node into the modern Query AST, normalising bare
-        // term strings through the configured tokenizer (the parser splits on
-        // whitespace only and does not lowercase). A term that normalises to
-        // multiple sub-tokens - which can happen with n-gram or breaking
-        // tokenizers - becomes an implicit AND of single-token TermQueries, which
-        // gives a sensible BM25 sum and mirrors how the legacy phrase path
-        // intersects multi-token terms.
         private Queries.Query ConvertLegacyNode(QueryNode node, byte field = 0)
         {
             switch (node)
@@ -587,8 +544,6 @@ namespace SimdPhrase2
                 case Queries.AndQuery aq:
                 {
                     if (aq.Clauses.Count == 0) return new HashSet<uint>();
-                    // Evaluate MUST_NOT clauses lazily so we don't materialize a giant
-                    // doc set for negation when not needed.
                     HashSet<uint> running = null;
                     var negations = new List<Queries.NotQuery>();
                     foreach (var clause in aq.Clauses)
@@ -616,7 +571,6 @@ namespace SimdPhrase2
                 }
                 case Queries.NotQuery topNot:
                 {
-                    // Top-level NOT: complement against all live doc ids in the index.
                     var negDocs = EvaluateBoolean(topNot.Child);
                     var result = new HashSet<uint>();
                     int total = (int)_indexStats.TotalDocs;
@@ -640,9 +594,6 @@ namespace SimdPhrase2
             public uint TotalDocs;
         }
 
-        // Specialized leaf used by the legacy SearchBM25(string, ...) entry point.
-        // Represents a flat list of term queries within a single field, scored
-        // independently with OR semantics (any matching token contributes).
         private sealed class TermsBM25Query : Queries.Query
         {
             public byte Field { get; }
@@ -651,8 +602,6 @@ namespace SimdPhrase2
             public override IEnumerable<Queries.Query> Children => Array.Empty<Queries.Query>();
         }
 
-        // Returns null when the subtree contributed no scores (e.g. a NotQuery
-        // alone, or an empty subquery). Otherwise returns a dict of docId -> score.
         private Dictionary<uint, float> EvaluateScore(Queries.Query query, ScoringContext ctx, float boost)
         {
             switch (query)
@@ -678,7 +627,6 @@ namespace SimdPhrase2
                     if (raw.Count == 0) return new Dictionary<uint, float>();
                     var tokens = MergeAndMinimizeTokens(pq.Field, raw);
                     var scores = new Dictionary<uint, float>();
-                    // Restrict scoring to docs that actually contain the phrase.
                     var matched = new HashSet<uint>(SearchField(pq.Field, pq.Phrase));
                     if (matched.Count == 0) return scores;
                     ScorePhraseAsTokens(pq.Field, tokens, boost, scores, ctx, restrictToDocs: matched);
@@ -688,9 +636,6 @@ namespace SimdPhrase2
                     return EvaluateScore(bq.Child, ctx, boost * bq.Boost);
                 case Queries.AndQuery aq:
                 {
-                    // Compute the doc set from the conjunction first (handling NOT
-                    // clauses), then sum scores from positive clauses that fall in
-                    // that set.
                     var docSet = EvaluateBoolean(aq);
                     if (docSet.Count == 0) return new Dictionary<uint, float>();
                     var combined = new Dictionary<uint, float>();
@@ -724,16 +669,11 @@ namespace SimdPhrase2
                     return combined;
                 }
                 case Queries.NotQuery:
-                    // A standalone NotQuery contributes no positive score. Boolean
-                    // membership is handled by AndQuery's negation pass.
                     return new Dictionary<uint, float>();
             }
             return new Dictionary<uint, float>();
         }
 
-        // Iterates over the tokens (one at a time), looks up the per-segment posting
-        // list for (field, token) and adds the BM25 contribution for each matching
-        // doc. When `restrictToDocs` is provided, only those doc ids accumulate.
         private void ScorePhraseAsTokens(byte field, List<string> tokens, float boost, Dictionary<uint, float> scores, ScoringContext ctx, HashSet<uint> restrictToDocs)
         {
             long N = ctx.TotalDocs;
@@ -742,7 +682,6 @@ namespace SimdPhrase2
 
             foreach (var t in tokens)
             {
-                // Aggregate doc count across segments.
                 int totalDocCount = 0;
                 foreach (var seg in _segments)
                 {
@@ -756,7 +695,7 @@ namespace SimdPhrase2
                 foreach (var seg in _segments)
                 {
                     if (!seg.Tokens.TryGet(field, t, out var offset)) continue;
-                    using var packed = seg.LoadPacked(offset);
+                    using var packed = seg.LoadPacked(field, t, offset);
                     var freqs = packed.GetDocIdsAndFreqs();
                     foreach (var (docId, tf) in freqs)
                     {

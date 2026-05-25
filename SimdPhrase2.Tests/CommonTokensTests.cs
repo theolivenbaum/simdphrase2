@@ -27,16 +27,18 @@ namespace SimdPhrase2.Tests
                 indexer.Commit();
             }
 
-            // Verify CommonTokens persistence
-            var loadedCommon = CommonTokensPersistence.Load(new FileSystemStorage(), Path.Combine(indexName, "common_tokens.bin"));
-            Assert.Contains("the", loadedCommon);
-            Assert.Contains("is", loadedCommon);
-            Assert.Contains("a", loadedCommon);
+            // Verify CommonTokens persistence via RocksDB meta CF.
+            using (var db = SimdPhraseDb.Open(indexName))
+            {
+                var loadedCommon = CommonTokensPersistence.Load(db);
+                Assert.Contains("the", loadedCommon);
+                Assert.Contains("is", loadedCommon);
+                Assert.Contains("a", loadedCommon);
+            }
 
             using (var searcher = new Searcher(indexName))
             {
                 // Search for "the cat"
-                // Ideally this uses merged token "the cat" if generated
                 var results = searcher.Search("the cat");
                 Assert.Single(results);
                 Assert.Equal(1u, results[0]);

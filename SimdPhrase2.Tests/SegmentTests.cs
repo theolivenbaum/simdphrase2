@@ -36,11 +36,11 @@ namespace SimdPhrase2.Tests
                 indexer.Commit();
             }
 
-            var storage = new FileSystemStorage();
-            var manifest = SegmentManifest.Load(storage, _indexName);
+            using var db = SimdPhraseDb.Open(_indexName);
+            var manifest = SegmentManifest.Load(db);
             Assert.True(manifest.Segments.Count >= 1);
 
-            using var searcher = new Searcher(_indexName);
+            using var searcher = new Searcher(_indexName, db: db);
             var docs = searcher.Search("bravo charlie");
             docs.Sort();
             Assert.Equal(new uint[] { 0, 1 }, docs.ToArray());
@@ -124,13 +124,13 @@ namespace SimdPhrase2.Tests
                 indexer.ForceMerge();
             }
 
-            var storage = new FileSystemStorage();
-            var manifest = SegmentManifest.Load(storage, _indexName);
+            using var db = SimdPhraseDb.Open(_indexName);
+            var manifest = SegmentManifest.Load(db);
             Assert.Single(manifest.Segments);
             // After ForceMerge deletes are physically removed.
             Assert.Equal(0, manifest.Segments[0].DeleteCount);
 
-            using var searcher = new Searcher(_indexName);
+            using var searcher = new Searcher(_indexName, db: db);
             var docs = searcher.Search("alpha bravo");
             docs.Sort();
             Assert.DoesNotContain(5u, docs);
@@ -150,13 +150,13 @@ namespace SimdPhrase2.Tests
                 }
             }
 
-            var storage = new FileSystemStorage();
-            var manifest = SegmentManifest.Load(storage, _indexName);
+            using var db = SimdPhraseDb.Open(_indexName);
+            var manifest = SegmentManifest.Load(db);
             // Auto-merge should have collapsed segments down well below the per-commit
             // count (30). Allow a little slack but ensure the policy actually fired.
             Assert.True(manifest.Segments.Count < 15, $"Expected merging to reduce segments, got {manifest.Segments.Count}");
 
-            using var searcher = new Searcher(_indexName);
+            using var searcher = new Searcher(_indexName, db: db);
             var docs = searcher.Search("foo bar baz");
             Assert.Equal(30, docs.Count);
         }

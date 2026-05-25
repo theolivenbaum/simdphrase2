@@ -4,4 +4,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="RocksDB" Version="10.10.1.649" />
+  </ItemGroup>
 </Project>

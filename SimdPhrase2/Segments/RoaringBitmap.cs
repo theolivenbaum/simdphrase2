@@ -124,6 +124,22 @@ namespace SimdPhrase2.Segments
             return bm;
         }
 
+        // Convenience byte[] helpers for callers (e.g. RocksDB-backed stores)
+        // that already have the bitmap as a flat byte[] - avoids wrapping in a
+        // MemoryStream at every call site.
+        public static RoaringBitmap LoadBytes(byte[] bytes)
+        {
+            using var ms = new MemoryStream(bytes, writable: false);
+            return Load(ms);
+        }
+
+        public byte[] SaveToBytes()
+        {
+            using var ms = new MemoryStream();
+            Save(ms);
+            return ms.ToArray();
+        }
+
         // ---------------- Containers ----------------
 
         internal interface IContainer
