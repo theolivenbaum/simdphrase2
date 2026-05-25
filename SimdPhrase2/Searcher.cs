@@ -505,6 +505,62 @@ namespace SimdPhrase2
             return results.OrderBy(x => x).ToList();
         }
 
+        // BM25-scored Boolean search over a string query. Parses with
+        // BooleanQueryParser (supporting AND / OR / NOT / parentheses / implicit AND)
+        // and ranks the matching docs with the same BM25 scorer used by SearchBM25.
+        //
+        // Lucene's BooleanQuery+BM25Similarity served as the conceptual model:
+        // each non-negated clause contributes a BM25 sub-score, those scores are
+        // summed per matching doc, and MUST_NOT clauses only filter the doc set.
+        // We deliberately do not replicate Lucene's deprecated coord factor or its
+        // scorer/iterator plumbing - the implementation here is a thin shim that
+        // reuses the existing EvaluateScore over the modern Query AST.
+        public List<(uint DocId, float Score)> SearchBooleanBM25(string query, int k = 10, float k1 = 1.2f, float b = 0.75f)
+        {
+            var parser = new BooleanQueryParser();
+            var root = parser.Parse(query);
+            if (root == null) return new List<(uint, float)>();
+            return SearchBooleanBM25(root, k, k1, b);
+        }
+
+        // BM25-scored Boolean search over a legacy QueryNode tree.
+        public List<(uint DocId, float Score)> SearchBooleanBM25(QueryNode root, int k = 10, float k1 = 1.2f, float b = 0.75f)
+        {
+            if (root == null) return new List<(uint, float)>();
+            var ast = ConvertLegacyNode(root);
+            return SearchBM25(ast, k, k1, b);
+        }
+
+        // Lift a legacy parser node into the modern Query AST, normalising bare
+        // term strings through the configured tokenizer (the parser splits on
+        // whitespace only and does not lowercase). A term that normalises to
+        // multiple sub-tokens - which can happen with n-gram or breaking
+        // tokenizers - becomes an implicit AND of single-token TermQueries, which
+        // gives a sensible BM25 sum and mirrors how the legacy phrase path
+        // intersects multi-token terms.
+        private Queries.Query ConvertLegacyNode(QueryNode node, byte field = 0)
+        {
+            switch (node)
+            {
+                case TermNode t:
+                {
+                    var tokens = TokenizeQuery(t.Term);
+                    if (tokens.Count == 0) return new Queries.TermQuery(field, t.Term);
+                    if (tokens.Count == 1) return new Queries.TermQuery(field, tokens[0]);
+                    var subs = new Queries.Query[tokens.Count];
+                    for (int i = 0; i < tokens.Count; i++) subs[i] = new Queries.TermQuery(field, tokens[i]);
+                    return new Queries.AndQuery(subs);
+                }
+                case AndNode a:
+                    return new Queries.AndQuery(ConvertLegacyNode(a.Left, field), ConvertLegacyNode(a.Right, field));
+                case OrNode o:
+                    return new Queries.OrQuery(ConvertLegacyNode(o.Left, field), ConvertLegacyNode(o.Right, field));
+                case NotNode n:
+                    return new Queries.NotQuery(ConvertLegacyNode(n.Child, field));
+            }
+            throw new ArgumentException($"Unknown QueryNode type: {node?.GetType().Name}");
+        }
+
         private IEnumerable<uint> EvaluateLegacyBoolean(QueryNode node)
         {
             if (node is TermNode t) return Search(t.Term);
