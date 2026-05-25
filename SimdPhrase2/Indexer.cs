@@ -173,7 +173,7 @@ namespace SimdPhrase2
                         bool isNextRare = !_commonTokens.Contains(nextToken.token);
                         if (isFirstRare && isNextRare) break;
 
-                        currentMerged += " " + nextToken;
+                        currentMerged += " " + nextToken.token;
 
                         list = ref CollectionsMarshal.GetValueRefOrAddDefault(docTokens, currentMerged, out exists);
                         if (!exists) list = new List<uint>();
