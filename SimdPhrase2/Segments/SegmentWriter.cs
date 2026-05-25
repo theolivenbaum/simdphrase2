@@ -28,7 +28,7 @@ namespace SimdPhrase2.Segments
             ISimdStorage storage,
             string indexPath,
             string segmentId,
-            Dictionary<string, RoaringishPacked> inMemoryBatch,
+            Dictionary<FieldToken, RoaringishPacked> inMemoryBatch,
             IReadOnlyList<string> stagedBatchFiles)
         {
             var dir = SegmentManifest.SegmentDirectory(storage, indexPath, segmentId);
@@ -91,22 +91,23 @@ namespace SimdPhrase2.Segments
         }
 
         // Merge any number of token-stream readers into a single segment directory.
-        // All readers expose entries of (token, packedBytes) sorted by token.
-        // Returns SegmentInfo with Id unset, but DocCount set to the true number of
-        // unique doc ids written, and SizeInBytes set to the packed file size.
-        // Also writes a doc_ids.bin roaring bitmap of the doc ids actually present in
-        // this segment so that delete tracking is precise even after merges.
+        // All readers expose entries of ((field,token), packedBytes) sorted by
+        // (field, token). Returns SegmentInfo with Id unset, but DocCount set to the
+        // true number of unique doc ids written, and SizeInBytes set to the packed
+        // file size. Also writes a doc_ids.bin roaring bitmap of the doc ids
+        // actually present in this segment so that delete tracking is precise even
+        // after merges.
         private static SegmentInfo MergeReadersIntoSegment(ISimdStorage storage, string dir, List<ISegmentInputReader> readers)
         {
-            var pq = new PriorityQueue<ISegmentInputReader, (string, int)>(Comparer<(string, int)>.Create((a, b) =>
+            var pq = new PriorityQueue<ISegmentInputReader, (FieldToken, int)>(Comparer<(FieldToken, int)>.Create((a, b) =>
             {
-                int cmp = string.CompareOrdinal(a.Item1, b.Item1);
+                int cmp = a.Item1.CompareTo(b.Item1);
                 return cmp != 0 ? cmp : a.Item2.CompareTo(b.Item2);
             }));
 
             foreach (var r in readers)
             {
-                if (!r.Finished) pq.Enqueue(r, (r.CurrentToken, r.Order));
+                if (!r.Finished) pq.Enqueue(r, (r.CurrentKey, r.Order));
             }
 
             using var tokenStore = new TokenStore(dir, storage);
@@ -118,7 +119,7 @@ namespace SimdPhrase2.Segments
             while (pq.Count > 0)
             {
                 var reader = pq.Dequeue();
-                string token = reader.CurrentToken;
+                FieldToken key = reader.CurrentKey;
 
                 // 64-byte align for SIMD loads.
                 long currentPos = packedFile.Position;
@@ -133,18 +134,18 @@ namespace SimdPhrase2.Segments
                 int docCount = 0;
                 uint lastDocId = uint.MaxValue;
 
-                // Collect all chunks for this token across readers in input order.
+                // Collect all chunks for this key across readers in input order.
                 var chunks = new List<byte[]>();
                 chunks.Add(reader.CurrentData);
                 reader.Next();
-                if (!reader.Finished) pq.Enqueue(reader, (reader.CurrentToken, reader.Order));
+                if (!reader.Finished) pq.Enqueue(reader, (reader.CurrentKey, reader.Order));
 
-                while (pq.Count > 0 && pq.Peek().CurrentToken == token)
+                while (pq.Count > 0 && pq.Peek().CurrentKey.Equals(key))
                 {
                     var nextReader = pq.Dequeue();
                     chunks.Add(nextReader.CurrentData);
                     nextReader.Next();
-                    if (!nextReader.Finished) pq.Enqueue(nextReader, (nextReader.CurrentToken, nextReader.Order));
+                    if (!nextReader.Finished) pq.Enqueue(nextReader, (nextReader.CurrentKey, nextReader.Order));
                 }
 
                 // The chunks are individually sorted by global doc id (each batch builds
@@ -164,7 +165,7 @@ namespace SimdPhrase2.Segments
                     KWayMergePackedToFile(chunks, packedFile, ref totalLength, ref lastDocId, ref docCount, liveDocs);
                 }
 
-                tokenStore.Add(token, startOffset, totalLength, docCount);
+                tokenStore.Add(key.Field, key.Token, startOffset, totalLength, docCount);
             }
 
             packedFile.Flush();
@@ -294,7 +295,7 @@ namespace SimdPhrase2.Segments
         internal interface ISegmentInputReader : IDisposable
         {
             int Order { get; }
-            string CurrentToken { get; }
+            FieldToken CurrentKey { get; }
             byte[] CurrentData { get; }
             bool Finished { get; }
             void Next();
@@ -304,27 +305,27 @@ namespace SimdPhrase2.Segments
         private sealed class InMemoryReader : ISegmentInputReader
         {
             public int Order { get; }
-            public string CurrentToken { get; private set; }
+            public FieldToken CurrentKey { get; private set; }
             public byte[] CurrentData { get; private set; }
             public bool Finished { get; private set; }
 
-            private readonly List<KeyValuePair<string, RoaringishPacked>> _items;
+            private readonly List<KeyValuePair<FieldToken, RoaringishPacked>> _items;
             private int _pos;
 
-            public InMemoryReader(Dictionary<string, RoaringishPacked> dict, int order)
+            public InMemoryReader(Dictionary<FieldToken, RoaringishPacked> dict, int order)
             {
                 Order = order;
-                _items = new List<KeyValuePair<string, RoaringishPacked>>(dict.Count);
+                _items = new List<KeyValuePair<FieldToken, RoaringishPacked>>(dict.Count);
                 foreach (var kvp in dict) _items.Add(kvp);
-                _items.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
+                _items.Sort((a, b) => a.Key.CompareTo(b.Key));
                 Next();
             }
 
             public void Next()
             {
-                if (_pos >= _items.Count) { Finished = true; CurrentToken = null; CurrentData = null; return; }
+                if (_pos >= _items.Count) { Finished = true; CurrentKey = default; CurrentData = null; return; }
                 var kvp = _items[_pos++];
-                CurrentToken = kvp.Key;
+                CurrentKey = kvp.Key;
                 var span = kvp.Value.AsSpan();
                 var bytes = new byte[span.Length * 8];
                 MemoryMarshal.Cast<ulong, byte>(span).CopyTo(bytes);
@@ -335,10 +336,11 @@ namespace SimdPhrase2.Segments
         }
 
         // Reader over a batch_<n>.bin file produced by the indexer.
+        // Format: repeated [byte field][string token][int len][len*8 bytes].
         private sealed class BatchFileReader : ISegmentInputReader
         {
             public int Order { get; }
-            public string CurrentToken { get; private set; }
+            public FieldToken CurrentKey { get; private set; }
             public byte[] CurrentData { get; private set; }
             public bool Finished { get; private set; }
 
@@ -355,11 +357,13 @@ namespace SimdPhrase2.Segments
 
             public void Next()
             {
-                if (_fs.Position >= _fs.Length) { Finished = true; CurrentToken = null; CurrentData = null; return; }
+                if (_fs.Position >= _fs.Length) { Finished = true; CurrentKey = default; CurrentData = null; return; }
                 try
                 {
-                    CurrentToken = _br.ReadString();
+                    byte field = _br.ReadByte();
+                    string token = _br.ReadString();
                     int len = _br.ReadInt32();
+                    CurrentKey = new FieldToken(field, token);
                     CurrentData = _br.ReadBytes(len * 8);
                 }
                 catch (EndOfStreamException)
@@ -371,45 +375,45 @@ namespace SimdPhrase2.Segments
             public void Dispose() { _br.Dispose(); _fs.Dispose(); }
         }
 
-        // Reader over a fully built SegmentReader. Iterates tokens in sorted order
-        // (TokenStore is a Dictionary, so we sort here once). For each token, reads the
-        // matching slice of the packed file, applying the deletes bitmap by zeroing out
-        // values for deleted doc IDs (and dropping fully-deleted entries).
+        // Reader over a fully built SegmentReader. Iterates entries in sorted order
+        // (by field then token). For each entry, reads the matching slice of the
+        // packed file, applying the deletes bitmap by dropping entries that belong
+        // to deleted doc IDs.
         private sealed class SegmentTokenReader : ISegmentInputReader
         {
             public int Order { get; }
-            public string CurrentToken { get; private set; }
+            public FieldToken CurrentKey { get; private set; }
             public byte[] CurrentData { get; private set; }
             public bool Finished { get; private set; }
 
             private readonly SegmentReader _segment;
-            private readonly List<string> _tokens;
+            private readonly List<FieldToken> _keys;
             private int _pos;
 
             public SegmentTokenReader(SegmentReader segment, int order)
             {
                 Order = order;
                 _segment = segment;
-                _tokens = new List<string>(segment.Tokens.GetAllTokens());
-                _tokens.Sort(StringComparer.Ordinal);
+                _keys = new List<FieldToken>(segment.Tokens.GetAllEntries());
+                _keys.Sort();
                 Next();
             }
 
             public void Next()
             {
-                while (_pos < _tokens.Count)
+                while (_pos < _keys.Count)
                 {
-                    string token = _tokens[_pos++];
-                    if (!_segment.Tokens.TryGet(token, out var offset)) continue;
+                    var key = _keys[_pos++];
+                    if (!_segment.Tokens.TryGet(key.Field, key.Token, out var offset)) continue;
                     using var packed = _segment.LoadPacked(offset);
                     var data = ApplyDeletes(packed.AsSpan(), _segment.Deletes);
                     if (data.Length == 0) continue; // entirely deleted
-                    CurrentToken = token;
+                    CurrentKey = key;
                     CurrentData = data;
                     return;
                 }
                 Finished = true;
-                CurrentToken = null;
+                CurrentKey = default;
                 CurrentData = null;
             }
 

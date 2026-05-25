@@ -16,7 +16,9 @@ namespace SimdPhrase2
         private readonly string _indexName;
         private readonly int _batchSize;
         private int _currentBatchCount;
-        private Dictionary<string, RoaringishPacked> _currentBatch;
+        // In-memory token batch keyed by (field, token). All fields share a single
+        // packed file per segment - per-field separation is purely at the key level.
+        private Dictionary<FieldToken, RoaringishPacked> _currentBatch;
         // List of staged batch files spilled to disk during this commit (only filled
         // when one commit produces more than _batchSize docs).
         private List<string> _stagedBatchFiles;
@@ -25,7 +27,9 @@ namespace SimdPhrase2
 
         private CommonTokensConfig _commonTokensConfig;
         private HashSet<string> _commonTokens;
-        private List<(string content, uint docId)> _firstBatchBuffer;
+        // First-batch buffer holds per-field contents so common-token detection can
+        // see the full document text.
+        private List<(string[] fieldContents, uint docId)> _firstBatchBuffer;
         private bool _isFirstBatch;
         private ITextTokenizer _tokenizer;
         private ISimdStorage _storage;
@@ -36,7 +40,9 @@ namespace SimdPhrase2
 
         // Stats (global - aggregated across segments)
         private uint _totalDocs;
-        private ulong _totalTokens;
+        private ulong _totalTokens;            // sum across fields
+        private ulong[] _totalTokensPerField;
+        private readonly int _fieldCount;
         private Stream _docLengthsStream;
         private readonly object _lock = new object();
 
@@ -46,20 +52,27 @@ namespace SimdPhrase2
         // segment before it is sealed).
         private readonly HashSet<uint> _pendingDeletes = new();
 
-        public Indexer(string indexName, CommonTokensConfig commonTokensConfig = null, int batchSize = 300_000, ITextTokenizer tokenizer = null, ISimdStorage storage = null, TieredMergePolicy mergePolicy = null)
+        public int FieldCount => _fieldCount;
+
+        public Indexer(string indexName, CommonTokensConfig commonTokensConfig = null, int batchSize = 300_000, ITextTokenizer tokenizer = null, ISimdStorage storage = null, TieredMergePolicy mergePolicy = null, int fieldCount = 1)
         {
+            if (fieldCount < 1 || fieldCount > 256)
+                throw new ArgumentOutOfRangeException(nameof(fieldCount), "fieldCount must be between 1 and 256.");
+
             _indexName = indexName;
             _batchSize = batchSize;
             _tokenizer = tokenizer ?? new BasicTokenizer();
             _storage = storage ?? new FileSystemStorage();
             _commonTokensConfig = commonTokensConfig ?? CommonTokensConfig.None;
-            _currentBatch = new Dictionary<string, RoaringishPacked>();
+            _currentBatch = new Dictionary<FieldToken, RoaringishPacked>();
             _currentBatchCount = 0;
             _stagedBatchFiles = new List<string>();
             _spillId = 0;
             _mergePolicy = mergePolicy ?? new TieredMergePolicy();
+            _fieldCount = fieldCount;
+            _totalTokensPerField = new ulong[fieldCount];
 
-            _firstBatchBuffer = new List<(string, uint)>();
+            _firstBatchBuffer = new List<(string[], uint)>();
             _isFirstBatch = true;
             _commonTokens = new HashSet<string>();
 
@@ -85,9 +98,22 @@ namespace SimdPhrase2
             {
                 _isFirstBatch = false;
                 _commonTokens = CommonTokensPersistence.Load(_storage, _storage.Combine(_indexName, "common_tokens.bin"));
+
+                // If the existing index already records a field count, refuse to
+                // change it on reopen - the on-disk layout is fixed.
+                if (existing.FieldCount > 0 && existing.FieldCount != fieldCount)
+                {
+                    throw new InvalidOperationException($"Existing index has fieldCount={existing.FieldCount}, but Indexer was opened with fieldCount={fieldCount}.");
+                }
+                if (existing.TotalTokensPerField != null && existing.TotalTokensPerField.Length == fieldCount)
+                {
+                    Array.Copy(existing.TotalTokensPerField, _totalTokensPerField, fieldCount);
+                }
             }
         }
 
+        // Legacy single-field indexing: each tuple becomes a single-field document
+        // indexed into field 0.
         public void Index(IEnumerable<(string content, uint docId)> docs)
         {
             foreach (var (content, docId) in docs)
@@ -97,13 +123,40 @@ namespace SimdPhrase2
             Commit();
         }
 
+        // Multi-field indexing: caller provides one content per field for each
+        // document. Field index is the array index (0..fieldCount-1).
+        public void Index(IEnumerable<(string[] fieldContents, uint docId)> docs)
+        {
+            foreach (var (fieldContents, docId) in docs)
+            {
+                AddDocument(docId, fieldContents);
+            }
+            Commit();
+        }
+
+        // Legacy single-field add: maps to field 0 only. Valid for any fieldCount,
+        // but if fieldCount > 1 the other fields receive empty content.
         public void AddDocument(string content, uint docId)
         {
-            _docStore.AddDocument(docId, content);
+            var fields = new string[_fieldCount];
+            fields[0] = content ?? string.Empty;
+            for (int i = 1; i < _fieldCount; i++) fields[i] = string.Empty;
+            AddDocument(docId, fields);
+        }
+
+        // Primary multi-field entry point. The fieldContents array length must
+        // equal the indexer's fieldCount.
+        public void AddDocument(uint docId, params string[] fieldContents)
+        {
+            if (fieldContents == null) throw new ArgumentNullException(nameof(fieldContents));
+            if (fieldContents.Length != _fieldCount)
+                throw new ArgumentException($"Expected {_fieldCount} field contents, got {fieldContents.Length}.", nameof(fieldContents));
+
+            _docStore.AddDocument(docId, JoinForDocStore(fieldContents));
 
             if (_isFirstBatch)
             {
-                _firstBatchBuffer.Add((content, docId));
+                _firstBatchBuffer.Add(((string[])fieldContents.Clone(), docId));
                 _currentBatchCount++;
 
                 if (_currentBatchCount >= _batchSize)
@@ -113,13 +166,22 @@ namespace SimdPhrase2
             }
             else
             {
-                IndexDocumentInternal(content, docId);
+                IndexDocumentInternal(fieldContents, docId);
                 _currentBatchCount++;
                 if (_currentBatchCount >= _batchSize)
                 {
                     SpillBatch();
                 }
             }
+        }
+
+        // For the document store we keep the original behavior of storing one blob
+        // per doc. With multiple fields we join with a record separator so callers
+        // can still round-trip via GetDocument(); they get all fields back.
+        private static string JoinForDocStore(string[] fieldContents)
+        {
+            if (fieldContents.Length == 1) return fieldContents[0] ?? string.Empty;
+            return string.Join("", fieldContents);
         }
 
         // Mark a doc id as deleted. The actual deletion is recorded against existing
@@ -129,12 +191,24 @@ namespace SimdPhrase2
             _pendingDeletes.Add(docId);
         }
 
-        private void IndexDocumentInternal(string content, uint docId)
+        private void IndexDocumentInternal(string[] fieldContents, uint docId)
+        {
+            var perFieldLengths = new int[_fieldCount];
+
+            for (int f = 0; f < _fieldCount; f++)
+            {
+                string content = fieldContents[f] ?? string.Empty;
+                IndexFieldInternal((byte)f, content, docId, ref perFieldLengths[f]);
+            }
+
+            UpdateStats(docId, perFieldLengths);
+        }
+
+        private void IndexFieldInternal(byte field, string content, uint docId, ref int tokensCount)
         {
             var tokens = new List<(string token, uint index)>();
 
             var enumerator = _tokenizer.Tokenize(content.AsSpan()).GetEnumerator();
-            int tokensCount = 0;
             uint lastIndex = uint.MaxValue;
 
             while (enumerator.MoveNext())
@@ -146,8 +220,6 @@ namespace SimdPhrase2
                 }
                 lastIndex = enumerator.CurrentIndex;
             }
-
-            UpdateStats(docId, tokensCount);
 
             var docTokens = new Dictionary<string, List<uint>>();
 
@@ -186,64 +258,66 @@ namespace SimdPhrase2
 
             foreach (var (token, positions) in docTokens)
             {
-                if (!_currentBatch.TryGetValue(token, out var packed))
+                var key = new FieldToken(field, token);
+                if (!_currentBatch.TryGetValue(key, out var packed))
                 {
                     packed = new RoaringishPacked();
-                    _currentBatch[token] = packed;
+                    _currentBatch[key] = packed;
                 }
                 packed.Push(docId, positions);
             }
         }
 
-        private void UpdateStats(uint docId, int docLen)
+        private void UpdateStats(uint docId, int[] perFieldLengths)
         {
+            int totalLen = 0;
+            for (int i = 0; i < perFieldLengths.Length; i++) totalLen += perFieldLengths[i];
+
             lock (_lock)
             {
                 _totalDocs++;
-                _totalTokens += (ulong)docLen;
+                _totalTokens += (ulong)totalLen;
+                for (int i = 0; i < perFieldLengths.Length; i++)
+                {
+                    _totalTokensPerField[i] += (ulong)perFieldLengths[i];
+                }
 
-                long pos = (long)docId * 4;
+                // doc_lengths.bin: contiguous slot of fieldCount * 4 bytes per doc id.
+                long pos = (long)docId * 4L * _fieldCount;
                 if (pos != _docLengthsStream.Position)
                 {
                     _docLengthsStream.Seek(pos, SeekOrigin.Begin);
                 }
-                Span<byte> buffer = stackalloc byte[4];
-                BinaryPrimitives.WriteInt32LittleEndian(buffer, docLen);
-                _docLengthsStream.Write(buffer);
+                Span<byte> buffer = stackalloc byte[64];
+                int bytes = 4 * _fieldCount;
+                if (bytes > buffer.Length) buffer = new byte[bytes];
+                for (int i = 0; i < _fieldCount; i++)
+                {
+                    BinaryPrimitives.WriteInt32LittleEndian(buffer.Slice(i * 4, 4), perFieldLengths[i]);
+                }
+                _docLengthsStream.Write(buffer.Slice(0, bytes));
             }
         }
 
         private void GenerateCommonTokens()
         {
+            // Common tokens are computed over the union of all field contents in
+            // the first batch. They are then used (globally) to expand multi-token
+            // phrases at indexing time, regardless of which field the phrase comes
+            // from.
             if (_commonTokensConfig is CommonTokensConfig.ListConfig listConfig)
             {
                 _commonTokens = listConfig.Tokens;
             }
             else if (_commonTokensConfig is CommonTokensConfig.FixedNumConfig fixedNumConfig)
             {
-                var freq = new Dictionary<string, int>();
-                foreach (var (content, _) in _firstBatchBuffer)
-                {
-                    foreach (var tokenSpan in _tokenizer.Tokenize(content.AsSpan()))
-                    {
-                        string token = tokenSpan.ToString();
-                        freq[token] = freq.GetValueOrDefault(token, 0) + 1;
-                    }
-                }
+                var freq = ComputeFirstBatchFrequencies();
                 var top = freq.OrderByDescending(kvp => kvp.Value).Take(fixedNumConfig.Num).Select(kvp => kvp.Key);
                 _commonTokens = new HashSet<string>(top);
             }
             else if (_commonTokensConfig is CommonTokensConfig.PercentageConfig percentageConfig)
             {
-                var freq = new Dictionary<string, int>();
-                foreach (var (content, _) in _firstBatchBuffer)
-                {
-                    foreach (var tokenSpan in _tokenizer.Tokenize(content.AsSpan()))
-                    {
-                        string token = tokenSpan.ToString();
-                        freq[token] = freq.GetValueOrDefault(token, 0) + 1;
-                    }
-                }
+                var freq = ComputeFirstBatchFrequencies();
                 int count = (int)(freq.Count * percentageConfig.Percentage);
                 var top = freq.OrderByDescending(kvp => kvp.Value).Take(count).Select(kvp => kvp.Key);
                 _commonTokens = new HashSet<string>(top);
@@ -255,6 +329,24 @@ namespace SimdPhrase2
             }
         }
 
+        private Dictionary<string, int> ComputeFirstBatchFrequencies()
+        {
+            var freq = new Dictionary<string, int>();
+            foreach (var (fieldContents, _) in _firstBatchBuffer)
+            {
+                foreach (var content in fieldContents)
+                {
+                    if (string.IsNullOrEmpty(content)) continue;
+                    foreach (var tokenSpan in _tokenizer.Tokenize(content.AsSpan()))
+                    {
+                        string token = tokenSpan.ToString();
+                        freq[token] = freq.GetValueOrDefault(token, 0) + 1;
+                    }
+                }
+            }
+            return freq;
+        }
+
         // Spill current in-memory batch to a temporary file in the index root. Used
         // when the in-memory dictionary grows past _batchSize during a single commit.
         private void SpillBatch()
@@ -262,9 +354,9 @@ namespace SimdPhrase2
             if (_isFirstBatch)
             {
                 GenerateCommonTokens();
-                foreach (var (content, docId) in _firstBatchBuffer)
+                foreach (var (fields, docId) in _firstBatchBuffer)
                 {
-                    IndexDocumentInternal(content, docId);
+                    IndexDocumentInternal(fields, docId);
                 }
                 _firstBatchBuffer.Clear();
                 _isFirstBatch = false;
@@ -276,11 +368,13 @@ namespace SimdPhrase2
             using (var fs = _storage.OpenWrite(tempFile))
             using (var writer = new BinaryWriter(fs))
             {
-                var sortedTokens = _currentBatch.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList();
-                foreach (var token in sortedTokens)
+                var sortedKeys = _currentBatch.Keys.ToList();
+                sortedKeys.Sort();
+                foreach (var key in sortedKeys)
                 {
-                    var packed = _currentBatch[token];
-                    writer.Write(token);
+                    var packed = _currentBatch[key];
+                    writer.Write(key.Field);
+                    writer.Write(key.Token);
                     var span = packed.AsSpan();
                     writer.Write(packed.Length);
                     byte[] bytes = new byte[packed.Length * 8];
@@ -312,9 +406,9 @@ namespace SimdPhrase2
             if (_isFirstBatch)
             {
                 GenerateCommonTokens();
-                foreach (var (content, docId) in _firstBatchBuffer)
+                foreach (var (fields, docId) in _firstBatchBuffer)
                 {
-                    IndexDocumentInternal(content, docId);
+                    IndexDocumentInternal(fields, docId);
                 }
                 _firstBatchBuffer.Clear();
                 _isFirstBatch = false;
@@ -443,12 +537,12 @@ namespace SimdPhrase2
         {
             // Save manifest
             _manifest.Save(_storage, _indexName);
-            // Save aggregated stats - reflect live docs.
-            // _totalDocs and _totalTokens are tracked in-memory; we persist them.
             var stats = new IndexStats
             {
                 TotalDocs = _totalDocs,
-                TotalTokens = _totalTokens
+                TotalTokens = _totalTokens,
+                FieldCount = _fieldCount,
+                TotalTokensPerField = (ulong[])_totalTokensPerField.Clone(),
             };
             IndexStats.Save(_storage, _storage.Combine(_indexName, "index_stats.json"), stats);
         }
