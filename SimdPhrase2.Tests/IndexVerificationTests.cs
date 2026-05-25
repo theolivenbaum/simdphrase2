@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using Xunit;
 using SimdPhrase2.Db;
+using SimdPhrase2.Segments;
 using SimdPhrase2.Storage;
 
 namespace SimdPhrase2.Tests
@@ -56,18 +57,21 @@ namespace SimdPhrase2.Tests
                 Assert.Equal(3, br.ReadInt32());
             }
 
-            // Verify TokenStore counts
-            using (var tokenStore = new TokenStore(_indexName))
+            // Verify TokenStore counts (tokens now live in segments)
+            var storage = new FileSystemStorage();
+            var manifest = SegmentManifest.Load(storage, _indexName);
+            Assert.Single(manifest.Segments);
+            int helloDocs = 0, worldDocs = 0, universeDocs = 0;
+            foreach (var seg in manifest.Segments)
             {
-                Assert.True(tokenStore.TryGet("hello", out var offset));
-                Assert.Equal(3, offset.DocCount);
-
-                Assert.True(tokenStore.TryGet("world", out offset));
-                Assert.Equal(2, offset.DocCount);
-
-                Assert.True(tokenStore.TryGet("universe", out offset));
-                Assert.Equal(1, offset.DocCount);
+                using var sr = new SegmentReader(storage, _indexName, seg);
+                if (sr.Tokens.TryGet("hello", out var off1)) helloDocs += off1.DocCount;
+                if (sr.Tokens.TryGet("world", out var off2)) worldDocs += off2.DocCount;
+                if (sr.Tokens.TryGet("universe", out var off3)) universeDocs += off3.DocCount;
             }
+            Assert.Equal(3, helloDocs);
+            Assert.Equal(2, worldDocs);
+            Assert.Equal(1, universeDocs);
         }
     }
 }

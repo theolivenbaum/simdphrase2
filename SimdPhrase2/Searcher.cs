@@ -7,6 +7,7 @@ using System.Buffers.Binary;
 using SimdPhrase2.Db;
 using SimdPhrase2.Roaringish;
 using SimdPhrase2.Roaringish.Intersect;
+using SimdPhrase2.Segments;
 using SimdPhrase2.Storage;
 
 namespace SimdPhrase2
@@ -14,14 +15,17 @@ namespace SimdPhrase2
     public class Searcher : IDisposable
     {
         private readonly string _indexName;
-        private TokenStore _tokenStore;
         private DocumentStore _docStore;
-        private Stream? _packedFile;
         private IIntersect _intersect;
         private Stats _stats;
         private HashSet<string> _commonTokens;
         private ITextTokenizer _tokenizer;
         private ISimdStorage _storage;
+
+        private List<SegmentReader> _segments;
+        // Aggregated total length per token across all segments, lazily filled and cached.
+        // Used by MergeAndMinimizeTokens for cost estimation.
+        private Dictionary<string, long> _tokenLengthCache;
 
         // BM25 / Boolean support
         private Stream? _docLengthsStream;
@@ -33,16 +37,11 @@ namespace SimdPhrase2
             _indexName = indexName;
             _tokenizer = tokenizer ?? new BasicTokenizer();
             _storage = storage ?? new FileSystemStorage();
-            _tokenStore = new TokenStore(indexName, _storage);
             _docStore = new DocumentStore(indexName, _storage);
-            string packedPath = _storage.Combine(indexName, "roaringish_packed.bin");
-            if (_storage.FileExists(packedPath))
-            {
-                _packedFile = _storage.OpenRead(packedPath);
-            }
-            _intersect = forceNaive ? new NaiveIntersect() :  new SimdIntersect();
+            _intersect = forceNaive ? new NaiveIntersect() : new SimdIntersect();
             _stats = new Stats();
             _commonTokens = CommonTokensPersistence.Load(_storage, _storage.Combine(indexName, "common_tokens.bin"));
+            _tokenLengthCache = new Dictionary<string, long>();
 
             string docLengthsPath = _storage.Combine(indexName, "doc_lengths.bin");
             if (_storage.FileExists(docLengthsPath))
@@ -52,7 +51,39 @@ namespace SimdPhrase2
             _indexStats = IndexStats.Load(_storage, statsPath);
             if (_indexStats.TotalDocs > 0)
                 _avgDocLength = (float)_indexStats.TotalTokens / _indexStats.TotalDocs;
+
+            _segments = new List<SegmentReader>();
+            var manifest = SegmentManifest.Load(_storage, _indexName);
+            foreach (var seg in manifest.Segments)
+            {
+                _segments.Add(new SegmentReader(_storage, _indexName, seg));
+            }
         }
+
+        // Aggregate token length across all segments. Used only for query planning.
+        private bool TryGetAggregateLength(string token, out long totalLength)
+        {
+            if (_tokenLengthCache.TryGetValue(token, out totalLength))
+            {
+                return totalLength > 0;
+            }
+            long sum = 0;
+            bool found = false;
+            foreach (var seg in _segments)
+            {
+                if (seg.Tokens.TryGet(token, out var off))
+                {
+                    found = true;
+                    sum += off.Length;
+                }
+            }
+            _tokenLengthCache[token] = found ? sum : -1;
+            totalLength = sum;
+            return found;
+        }
+
+        // Returns true if the token exists in at least one segment.
+        private bool TokenExists(string token) => TryGetAggregateLength(token, out _);
 
         private List<string> MergeAndMinimizeTokens(List<string> tokens)
         {
@@ -68,51 +99,44 @@ namespace SimdPhrase2
 
             for (int i = n - 1; i >= 0; i--)
             {
-                // Try single token
                 string t = tokens[i];
-                if (_tokenStore.TryGet(t, out var offset))
+                if (TryGetAggregateLength(t, out long aggLen))
                 {
-                    long cost = (offset.Length / 8);
+                    long cost = aggLen / 8;
                     if (dp[i + 1] != long.MaxValue)
                     {
-                         cost += dp[i + 1];
-                         if (cost < dp[i])
-                         {
-                             dp[i] = cost;
-                             choice[i] = t;
-                             nextIndex[i] = i + 1;
-                         }
+                        cost += dp[i + 1];
+                        if (cost < dp[i])
+                        {
+                            dp[i] = cost;
+                            choice[i] = t;
+                            nextIndex[i] = i + 1;
+                        }
                     }
                 }
                 else
                 {
-                     // Token not found.
-                     // This means searching will fail anyway.
-                     // We prefer to fail fast with this token.
-                     dp[i] = 0;
-                     choice[i] = t;
-                     nextIndex[i] = i + 1;
+                    dp[i] = 0;
+                    choice[i] = t;
+                    nextIndex[i] = i + 1;
                 }
 
-                // Try merging
                 bool isFirstRare = !_commonTokens.Contains(t);
                 string currentMerged = t;
 
                 int maxWindow = 3;
                 for (int j = 1; j < maxWindow && (i + j) < n; j++)
                 {
-                    string nextToken = tokens[i+j];
+                    string nextToken = tokens[i + j];
                     bool isNextRare = !_commonTokens.Contains(nextToken);
-
                     if (isFirstRare && isNextRare) break;
-
                     currentMerged += " " + nextToken;
 
-                    if (_tokenStore.TryGet(currentMerged, out offset))
+                    if (TryGetAggregateLength(currentMerged, out long mergedLen))
                     {
                         if (dp[i + j + 1] != long.MaxValue)
                         {
-                            long cost = (offset.Length / 8) + dp[i + j + 1];
+                            long cost = (mergedLen / 8) + dp[i + j + 1];
                             if (cost < dp[i])
                             {
                                 dp[i] = cost;
@@ -130,72 +154,128 @@ namespace SimdPhrase2
             int curr = 0;
             while (curr < n)
             {
-                if (choice[curr] == null) return tokens; // Should not happen
+                if (choice[curr] == null) return tokens;
                 result.Add(choice[curr]);
                 curr = nextIndex[curr];
             }
             return result;
         }
 
-        private RoaringishPacked LoadPacked(FileOffset offset)
+        // Tokenize a query string, collapsing dual-emitted alternate surface forms (the
+        // tokenizer emits both the original and the lowercased form at the same token
+        // index for words containing uppercase letters, to support lemmatization-style
+        // multi-token-per-position indexing). At query time we want one canonical form
+        // per position - we keep the LAST emitted token at each index, which is the
+        // lowercased/lemma form per the BasicTokenizer contract. The indexer stores
+        // both forms, so the lowercase variant matches both case-variant doc inputs.
+        // Without this collapse, "A" would tokenize to ["A","a"] at the same index and
+        // Search would phrase-intersect them as if they were sequential tokens - which
+        // never matches because they share a position.
+        private List<string> TokenizeQuery(string query)
         {
-             int ulongCount = (int)(offset.Length / 8);
-             var buffer = new AlignedBuffer<ulong>(ulongCount);
-             buffer.SetLength(ulongCount);
-
-             _packedFile.Seek(offset.Begin, SeekOrigin.Begin);
-
-             Span<byte> byteSpan = MemoryMarshal.Cast<ulong, byte>(buffer.AsSpan());
-             _packedFile.ReadExactly(byteSpan);
-
-             return new RoaringishPacked(buffer, takeOwnership: true);
+            var rawTokens = new List<string>();
+            var enumerator = _tokenizer.Tokenize(query.AsSpan()).GetEnumerator();
+            uint lastIndex = uint.MaxValue;
+            while (enumerator.MoveNext())
+            {
+                string tokenStr = enumerator.Current.ToString();
+                if (rawTokens.Count > 0 && enumerator.CurrentIndex == lastIndex)
+                {
+                    rawTokens[rawTokens.Count - 1] = tokenStr;
+                }
+                else
+                {
+                    rawTokens.Add(tokenStr);
+                    lastIndex = enumerator.CurrentIndex;
+                }
+            }
+            return rawTokens;
         }
 
         public List<uint> Search(string query)
         {
-            if (_packedFile == null) return new List<uint>();
+            if (_segments.Count == 0) return new List<uint>();
 
-            var rawTokens = new List<string>();
-            foreach(var t in _tokenizer.Tokenize(query.AsSpan()))
-            {
-                rawTokens.Add(t.ToString());
-            }
-
+            var rawTokens = TokenizeQuery(query);
             if (rawTokens.Count == 0) return new List<uint>();
 
             var tokens = MergeAndMinimizeTokens(rawTokens);
 
-            var packedTokens = new List<(string Token, RoaringishPacked Packed)>();
+            // Early exit: any token absent from every segment means zero results.
+            foreach (var t in tokens)
+            {
+                if (!TokenExists(t)) return new List<uint>();
+            }
 
+            // Fast path: exactly one segment - identical to the previous single-index
+            // implementation, no extra allocation, preserves SIMD performance.
+            if (_segments.Count == 1)
+            {
+                return SearchSegment(_segments[0], tokens);
+            }
+
+            // Multi-segment path: run the same phrase-intersect per segment, union the
+            // doc ids directly into a single aggregate buffer. The buffer-appending
+            // overload of SearchSegment lets us skip the intermediate per-segment
+            // List<uint> that the allocating overload would produce.
+            var aggregate = new List<uint>();
+            foreach (var seg in _segments)
+            {
+                SearchSegment(seg, tokens, aggregate);
+            }
+            return aggregate;
+        }
+
+        /// <summary>
+        /// Allocating variant: runs the phrase intersection against a single segment
+        /// and returns the matching doc ids as a new <see cref="List{T}"/>. Use this
+        /// when the caller wants an owned result (e.g. the single-segment fast path,
+        /// which returns directly to the public <c>Search</c> caller). Internally
+        /// delegates to the buffer-appending overload after allocating the list.
+        /// </summary>
+        private List<uint> SearchSegment(SegmentReader seg, List<string> tokens)
+        {
+            var output = new List<uint>();
+            SearchSegment(seg, tokens, output);
+            return output;
+        }
+
+        /// <summary>
+        /// Buffer-appending variant: runs the phrase intersection against a single
+        /// segment and appends the matching doc ids into <paramref name="output"/>
+        /// without allocating an intermediate list. This is the form used by the
+        /// multi-segment union path, where every segment writes into the same
+        /// caller-owned aggregate buffer; it avoids both the per-segment <c>List</c>
+        /// allocation and the post-hoc deletes-filtering copy by checking the
+        /// segment's deletes bitmap inline as doc ids are appended.
+        /// The actual SIMD intersect kernel (<see cref="Intersect"/>) is unchanged.
+        /// </summary>
+        private void SearchSegment(SegmentReader seg, List<string> tokens, List<uint> output)
+        {
+            var packedTokens = new List<(string Token, RoaringishPacked Packed)>();
             try
             {
                 foreach (var token in tokens)
                 {
-                    if (!_tokenStore.TryGet(token, out var offset))
+                    if (!seg.Tokens.TryGet(token, out var offset))
                     {
-                        // Console.WriteLine($"Token not found: {token}");
-                        return new List<uint>();
+                        return;
                     }
-
-                    packedTokens.Add((token, LoadPacked(offset)));
+                    packedTokens.Add((token, seg.LoadPacked(offset)));
                 }
 
                 if (packedTokens.Count == 1)
                 {
-                     return packedTokens[0].Packed.GetDocIds();
+                    AppendDocIdsFiltered(packedTokens[0].Packed, seg.Deletes, output);
+                    return;
                 }
 
                 int bestIdx = 0;
                 long minLen = long.MaxValue;
-
                 for (int i = 0; i < packedTokens.Count - 1; i++)
                 {
-                    long len = packedTokens[i].Packed.Length + packedTokens[i+1].Packed.Length;
-                    if (len < minLen)
-                    {
-                        minLen = len;
-                        bestIdx = i;
-                    }
+                    long len = packedTokens[i].Packed.Length + packedTokens[i + 1].Packed.Length;
+                    if (len < minLen) { minLen = len; bestIdx = i; }
                 }
 
                 var lhsItem = packedTokens[bestIdx];
@@ -205,14 +285,12 @@ namespace SimdPhrase2
 
                 int leftI = bestIdx - 1;
                 int rightI = bestIdx + 2;
-
                 int resultPhraseLen = 2;
 
                 while (true)
                 {
                     RoaringishPacked nextLhs = leftI >= 0 ? packedTokens[leftI].Packed : null;
                     RoaringishPacked nextRhs = rightI < packedTokens.Count ? packedTokens[rightI].Packed : null;
-
                     if (nextLhs == null && nextRhs == null) break;
 
                     RoaringishPacked oldResult = result;
@@ -225,23 +303,48 @@ namespace SimdPhrase2
                     }
                     else
                     {
-                         result = Intersect(result, nextRhs, 1);
-                         resultPhraseLen++;
-                         rightI++;
+                        result = Intersect(result, nextRhs, 1);
+                        resultPhraseLen++;
+                        rightI++;
                     }
 
-                    oldResult.Dispose(); // Free intermediate result
-
+                    oldResult.Dispose();
                     if (result.Length == 0) break;
                 }
 
-                var docIds = result.GetDocIds();
+                AppendDocIdsFiltered(result, seg.Deletes, output);
                 result.Dispose();
-                return docIds;
             }
             finally
             {
-                foreach(var pt in packedTokens) pt.Packed.Dispose();
+                foreach (var pt in packedTokens) pt.Packed.Dispose();
+            }
+        }
+
+        // Appends the unique doc ids from `packed` into `output`, skipping any doc id
+        // present in `deletes`. The fast path (no deletes) delegates to the
+        // buffer-appending RoaringishPacked.GetDocIds overload; the slow path walks
+        // the packed span once and filters inline, avoiding a temporary list.
+        private static void AppendDocIdsFiltered(RoaringishPacked packed, RoaringBitmap deletes, List<uint> output)
+        {
+            if (deletes.IsEmpty)
+            {
+                packed.GetDocIds(output);
+                return;
+            }
+
+            var span = packed.AsSpan();
+            if (span.Length == 0) return;
+
+            uint lastDocId = RoaringishPacked.UnpackDocId(span[0]);
+            if (!deletes.Contains(lastDocId)) output.Add(lastDocId);
+
+            for (int i = 1; i < span.Length; i++)
+            {
+                uint docId = RoaringishPacked.UnpackDocId(span[i]);
+                if (docId == lastDocId) continue;
+                lastDocId = docId;
+                if (!deletes.Contains(docId)) output.Add(docId);
             }
         }
 
@@ -257,17 +360,14 @@ namespace SimdPhrase2
 
             using var packedResult = new AlignedBuffer<ulong>(size);
             packedResult.SetLength(size);
-            using var msbPackedResult = new AlignedBuffer<ulong>(lhs.Length + 1); // Rust uses lhs.len() + 1
+            using var msbPackedResult = new AlignedBuffer<ulong>(lhs.Length + 1);
             msbPackedResult.SetLength(lhs.Length + 1);
 
             int lhsI = 0, rhsI = 0, i = 0, j = 0;
 
-            // First Pass
             int packedLen1 = 0;
             int msbLen1 = 0;
 
-            // Check proportion for Gallop First Pass
-            // Avoid division by zero
             int minLen = Math.Min(lhs.Length, rhs.Length);
             int maxLen = Math.Max(lhs.Length, rhs.Length);
             int proportion = minLen > 0 ? maxLen / minLen : 0;
@@ -276,9 +376,6 @@ namespace SimdPhrase2
             {
                 GallopIntersectFirst.Intersect(true, lhs.AsSpan(), rhs.AsSpan(), packedResult, ref i, addToGroup, lhsLen, lsbMask, _stats);
                 packedLen1 = i;
-
-                // We need to run it again for msb part (first=false logic equivalent for GallopFirst)
-                // Note: GallopIntersectFirst handles first=false logic too
                 GallopIntersectFirst.Intersect(false, lhs.AsSpan(), rhs.AsSpan(), msbPackedResult, ref j, addToGroup, lhsLen, lsbMask, _stats);
                 msbLen1 = j;
             }
@@ -291,19 +388,30 @@ namespace SimdPhrase2
 
             if (msbLen1 == 0)
             {
-                 var ret = new RoaringishPacked(packedLen1);
-                 ret.Buffer.SetLength(packedLen1);
-                 packedResult.AsSpan(0, packedLen1).CopyTo(ret.Buffer.AsSpan());
-                 return ret;
+                // The SIMD/Naive first-pass kernels write a (docIdGroup | 0) entry whenever
+                // two docIdGroups match but the phrase intersection is empty (e.g. "is" at
+                // position 2 and "a" at position 0 of the same doc). MergeResults filters
+                // those out when msbLen1 > 0, but the no-MSB-carry early-return path here
+                // bypasses MergeResults, so we replicate the same values > 0 filter inline.
+                // The Gallop kernels already guard their write with intersection > 0.
+                var src = packedResult.AsSpan(0, packedLen1);
+                var ret = new RoaringishPacked(packedLen1);
+                var dst = ret.Buffer;
+                for (int k = 0; k < src.Length; k++)
+                {
+                    if (RoaringishPacked.UnpackValues(src[k]) > 0)
+                    {
+                        dst.Add(src[k]);
+                    }
+                }
+                return ret;
             }
 
-            // Second Pass
             using var msbResult2 = new AlignedBuffer<ulong>(size);
             msbResult2.SetLength(size);
             using var dummy = new AlignedBuffer<ulong>(0);
 
             int msbLen2 = 0;
-
             minLen = Math.Min(msbLen1, rhs.Length);
             maxLen = Math.Max(msbLen1, rhs.Length);
             proportion = minLen > 0 ? maxLen / minLen : 0;
@@ -321,15 +429,13 @@ namespace SimdPhrase2
                 msbLen2 = i2;
             }
 
-            // Merge
             return RoaringishPacked.MergeResults(packedResult, packedLen1, msbResult2, msbLen2);
         }
 
         public void Dispose()
         {
-            _tokenStore.Dispose();
+            foreach (var s in _segments) s.Dispose();
             _docStore.Dispose();
-            _packedFile?.Dispose();
             _docLengthsStream?.Dispose();
         }
 
@@ -340,10 +446,8 @@ namespace SimdPhrase2
         private int GetDocLength(uint docId)
         {
             if (_docLengthsStream == null) return 0;
-            // docLengths is int32 array.
             long pos = (long)docId * 4;
             if (pos >= _docLengthsStream.Length) return 0;
-
             _docLengthsStream.Seek(pos, SeekOrigin.Begin);
             Span<byte> buffer = stackalloc byte[4];
             int read = _docLengthsStream.Read(buffer);
@@ -353,35 +457,42 @@ namespace SimdPhrase2
 
         public List<(uint DocId, float Score)> SearchBM25(string query, int k = 10, float k1 = 1.2f, float b = 0.75f)
         {
-            if (_packedFile == null) return new List<(uint, float)>();
+            if (_segments.Count == 0) return new List<(uint, float)>();
 
-            var tokens = new List<string>();
-            foreach(var t in _tokenizer.Tokenize(query.AsSpan()))
-            {
-                tokens.Add(t.ToString());
-            }
+            var tokens = TokenizeQuery(query);
             if (tokens.Count == 0) return new List<(uint, float)>();
 
             var scores = new Dictionary<uint, float>();
-            long N = _stats != null ? _indexStats.TotalDocs : 0; // Using _indexStats
-            float avgDocLength = (float)_avgDocLength;
-            foreach(var t in tokens)
+            long N = _indexStats.TotalDocs;
+            float avgDocLength = _avgDocLength;
+
+            foreach (var t in tokens)
             {
-                if (_tokenStore.TryGet(t, out var offset))
+                // Aggregate doc count across segments.
+                int totalDocCount = 0;
+                foreach (var seg in _segments)
                 {
-                     float idf = MathF.Log(1f + (N - offset.DocCount + 0.5f) / (offset.DocCount + 0.5f));
-                     if (idf < 0) idf = 0;
+                    if (seg.Tokens.TryGet(t, out var off)) totalDocCount += off.DocCount;
+                }
+                if (totalDocCount == 0) continue;
 
-                     using var packed = LoadPacked(offset);
-                     var freqs = packed.GetDocIdsAndFreqs();
-                     foreach(var (docId, tf) in freqs)
-                     {
-                         int docLen = GetDocLength(docId);
-                         float score = idf * (tf * (k1 + 1f)) / (tf + k1 * (1f - b + b * (docLen / avgDocLength)));
+                float idf = MathF.Log(1f + (N - totalDocCount + 0.5f) / (totalDocCount + 0.5f));
+                if (idf < 0) idf = 0;
 
-                         ref float scoreVal = ref CollectionsMarshal.GetValueRefOrAddDefault(scores, docId, out _);
-                         scoreVal += score;
-                     }
+                foreach (var seg in _segments)
+                {
+                    if (!seg.Tokens.TryGet(t, out var offset)) continue;
+                    using var packed = seg.LoadPacked(offset);
+                    var freqs = packed.GetDocIdsAndFreqs();
+                    foreach (var (docId, tf) in freqs)
+                    {
+                        if (!seg.Deletes.IsEmpty && seg.Deletes.Contains(docId)) continue;
+                        int docLen = GetDocLength(docId);
+                        float score = idf * (tf * (k1 + 1f)) / (tf + k1 * (1f - b + b * (docLen / avgDocLength)));
+
+                        ref float scoreVal = ref CollectionsMarshal.GetValueRefOrAddDefault(scores, docId, out _);
+                        scoreVal += score;
+                    }
                 }
             }
 
@@ -392,45 +503,28 @@ namespace SimdPhrase2
 
         public List<uint> SearchBoolean(string query)
         {
-             var parser = new BooleanQueryParser();
-             var root = parser.Parse(query);
-             if (root == null) return new List<uint>();
-             return SearchBoolean(root);
+            var parser = new BooleanQueryParser();
+            var root = parser.Parse(query);
+            if (root == null) return new List<uint>();
+            return SearchBoolean(root);
         }
 
         public List<uint> SearchBoolean(QueryNode root)
         {
-             if (root == null) return new List<uint>();
-
-             // Evaluate and sort
-             var results = Evaluate(root);
-             return results.OrderBy(x => x).ToList();
+            if (root == null) return new List<uint>();
+            var results = Evaluate(root);
+            return results.OrderBy(x => x).ToList();
         }
 
         private IEnumerable<uint> Evaluate(QueryNode node)
         {
-            if (node is TermNode t)
-            {
-                 // Use Search() to handle phrase search if term is multiple words?
-                 // Parser produces single words.
-                 // But if we want to support phrases in future, Search() is good.
-                 // Also, Search() handles normalization/tokenization of the term properly.
-                 return Search(t.Term);
-            }
-            if (node is AndNode a)
-            {
-                return Evaluate(a.Left).Intersect(Evaluate(a.Right));
-            }
-            if (node is OrNode o)
-            {
-                return Evaluate(o.Left).Union(Evaluate(o.Right));
-            }
+            if (node is TermNode t) return Search(t.Term);
+            if (node is AndNode a) return Evaluate(a.Left).Intersect(Evaluate(a.Right));
+            if (node is OrNode o) return Evaluate(o.Left).Union(Evaluate(o.Right));
             if (node is NotNode n)
             {
-                 // Calculate AllDocs - Child
-                 // We need to materialize child to HashSet for efficient check
-                 var childDocs = new HashSet<uint>(Evaluate(n.Child));
-                 return Enumerable.Range(0, (int)_indexStats.TotalDocs).Select(i => (uint)i).Where(id => !childDocs.Contains(id));
+                var childDocs = new HashSet<uint>(Evaluate(n.Child));
+                return Enumerable.Range(0, (int)_indexStats.TotalDocs).Select(i => (uint)i).Where(id => !childDocs.Contains(id));
             }
             return Enumerable.Empty<uint>();
         }

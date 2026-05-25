@@ -120,22 +120,33 @@ namespace SimdPhrase2.Roaringish
         public List<uint> GetDocIds()
         {
             var list = new List<uint>();
-            if (_buffer.Length == 0) return list;
+            GetDocIds(list);
+            return list;
+        }
+
+        /// <summary>
+        /// Appends the unique doc ids from this packed list into <paramref name="output"/>.
+        /// Use this overload to avoid allocating a new <see cref="List{T}"/> per call when
+        /// the caller already owns a buffer (e.g. when unioning results from multiple
+        /// segments).
+        /// </summary>
+        public void GetDocIds(List<uint> output)
+        {
+            if (_buffer.Length == 0) return;
 
             var span = _buffer.AsSpan();
             uint lastDocId = UnpackDocId(span[0]);
-            list.Add(lastDocId);
+            output.Add(lastDocId);
 
             for (int i = 1; i < span.Length; i++)
             {
                 uint docId = UnpackDocId(span[i]);
                 if (docId != lastDocId)
                 {
-                    list.Add(docId);
+                    output.Add(docId);
                     lastDocId = docId;
                 }
             }
-            return list;
         }
 
         public List<(uint DocId, int Freq)> GetDocIdsAndFreqs()

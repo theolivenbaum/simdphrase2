@@ -11,10 +11,11 @@ namespace SimdPhrase2.Tests
         public void Tokenize_ShouldSplitCorrectly()
         {
             var tokenizer = new BasicTokenizer();
-            // "  Hello, World!  " -> "Hello", ",", "World", "!"
-            // Normalization is now enabled by default in BasicTokenizer, so we expect lowercase.
+            // BasicTokenizer emits two tokens at the same index for words containing any
+            // uppercase letter (the original surface form and the lowercased form) to
+            // support lemmatization-style multi-token-per-position indexing.
             var input = "  Hello, World!  ".AsSpan();
-            var expected = new[] { "hello", ",", "world", "!" };
+            var expected = new[] { "Hello", "hello", ",", "World", "world", "!" };
 
             var result = new List<string>();
             foreach(var t in tokenizer.Tokenize(input))
@@ -47,8 +48,9 @@ namespace SimdPhrase2.Tests
             var inputStr = "The quick brown fox jumps over the lazy dog.";
             var input = inputStr.AsSpan();
 
-            // Expected: "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "."
-            var expected = new[] { "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "." };
+            // "The" emits twice (original + lowercased) at the same index; the remaining
+            // already-lowercase words emit once each.
+            var expected = new[] { "The", "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "." };
 
             var result = new List<string>();
             foreach(var t in tokenizer.Tokenize(input))
@@ -84,8 +86,9 @@ namespace SimdPhrase2.Tests
         {
             var tokenizer = new BasicTokenizer();
             var input = "UPPER Case".AsSpan();
-            // Should be lowercased
-            var expected = new[] { "upper", "case" };
+            // Each word with an uppercase letter emits its original form followed by the
+            // lowercased form at the same token index.
+            var expected = new[] { "UPPER", "upper", "Case", "case" };
 
             var result = new List<string>();
             foreach(var t in tokenizer.Tokenize(input))
@@ -101,8 +104,8 @@ namespace SimdPhrase2.Tests
         {
             var tokenizer = new BasicTokenizer();
             var input = "Crème Brûlée!".AsSpan();
-            // "crème", "brûlée", "!"
-            var expected = new[] { "crème", "brûlée", "!" };
+            // Unicode letters with case follow the same dual-emit rule as ASCII.
+            var expected = new[] { "Crème", "crème", "Brûlée", "brûlée", "!" };
 
             var result = new List<string>();
             foreach(var t in tokenizer.Tokenize(input))
