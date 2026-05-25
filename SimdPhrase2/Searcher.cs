@@ -188,32 +188,42 @@ namespace SimdPhrase2
             }
 
             // Multi-segment path: run the same phrase-intersect per segment, union the
-            // doc ids. Tokens missing from a particular segment contribute zero docs
-            // for that segment (intersect against an empty list is empty).
+            // doc ids directly into a single aggregate buffer. The buffer-appending
+            // overload of SearchSegment lets us skip the intermediate per-segment
+            // List<uint> that the allocating overload would produce.
             var aggregate = new List<uint>();
             foreach (var seg in _segments)
             {
-                var docs = SearchSegment(seg, tokens);
-                if (docs.Count == 0) continue;
-                if (seg.Deletes.IsEmpty)
-                {
-                    aggregate.AddRange(docs);
-                }
-                else
-                {
-                    foreach (var d in docs)
-                    {
-                        if (!seg.Deletes.Contains(d)) aggregate.Add(d);
-                    }
-                }
+                SearchSegment(seg, tokens, aggregate);
             }
             return aggregate;
         }
 
-        // Run the phrase intersection for one segment. Mirrors the previous in-process
-        // Search() body but scoped to a single segment's posting lists. The actual
-        // SIMD intersect kernel (Intersect()) is unchanged.
+        /// <summary>
+        /// Allocating variant: runs the phrase intersection against a single segment
+        /// and returns the matching doc ids as a new <see cref="List{T}"/>. Use this
+        /// when the caller wants an owned result (e.g. the single-segment fast path,
+        /// which returns directly to the public <c>Search</c> caller). Internally
+        /// delegates to the buffer-appending overload after allocating the list.
+        /// </summary>
         private List<uint> SearchSegment(SegmentReader seg, List<string> tokens)
+        {
+            var output = new List<uint>();
+            SearchSegment(seg, tokens, output);
+            return output;
+        }
+
+        /// <summary>
+        /// Buffer-appending variant: runs the phrase intersection against a single
+        /// segment and appends the matching doc ids into <paramref name="output"/>
+        /// without allocating an intermediate list. This is the form used by the
+        /// multi-segment union path, where every segment writes into the same
+        /// caller-owned aggregate buffer; it avoids both the per-segment <c>List</c>
+        /// allocation and the post-hoc deletes-filtering copy by checking the
+        /// segment's deletes bitmap inline as doc ids are appended.
+        /// The actual SIMD intersect kernel (<see cref="Intersect"/>) is unchanged.
+        /// </summary>
+        private void SearchSegment(SegmentReader seg, List<string> tokens, List<uint> output)
         {
             var packedTokens = new List<(string Token, RoaringishPacked Packed)>();
             try
@@ -222,19 +232,15 @@ namespace SimdPhrase2
                 {
                     if (!seg.Tokens.TryGet(token, out var offset))
                     {
-                        return new List<uint>();
+                        return;
                     }
                     packedTokens.Add((token, seg.LoadPacked(offset)));
                 }
 
                 if (packedTokens.Count == 1)
                 {
-                    var docs = packedTokens[0].Packed.GetDocIds();
-                    if (!seg.Deletes.IsEmpty)
-                    {
-                        docs = docs.Where(d => !seg.Deletes.Contains(d)).ToList();
-                    }
-                    return docs;
+                    AppendDocIdsFiltered(packedTokens[0].Packed, seg.Deletes, output);
+                    return;
                 }
 
                 int bestIdx = 0;
@@ -279,17 +285,39 @@ namespace SimdPhrase2
                     if (result.Length == 0) break;
                 }
 
-                var docIds = result.GetDocIds();
+                AppendDocIdsFiltered(result, seg.Deletes, output);
                 result.Dispose();
-                if (!seg.Deletes.IsEmpty)
-                {
-                    docIds = docIds.Where(d => !seg.Deletes.Contains(d)).ToList();
-                }
-                return docIds;
             }
             finally
             {
                 foreach (var pt in packedTokens) pt.Packed.Dispose();
+            }
+        }
+
+        // Appends the unique doc ids from `packed` into `output`, skipping any doc id
+        // present in `deletes`. The fast path (no deletes) delegates to the
+        // buffer-appending RoaringishPacked.GetDocIds overload; the slow path walks
+        // the packed span once and filters inline, avoiding a temporary list.
+        private static void AppendDocIdsFiltered(RoaringishPacked packed, RoaringBitmap deletes, List<uint> output)
+        {
+            if (deletes.IsEmpty)
+            {
+                packed.GetDocIds(output);
+                return;
+            }
+
+            var span = packed.AsSpan();
+            if (span.Length == 0) return;
+
+            uint lastDocId = RoaringishPacked.UnpackDocId(span[0]);
+            if (!deletes.Contains(lastDocId)) output.Add(lastDocId);
+
+            for (int i = 1; i < span.Length; i++)
+            {
+                uint docId = RoaringishPacked.UnpackDocId(span[i]);
+                if (docId == lastDocId) continue;
+                lastDocId = docId;
+                if (!deletes.Contains(docId)) output.Add(docId);
             }
         }
 
